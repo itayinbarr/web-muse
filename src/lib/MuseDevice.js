@@ -1,5 +1,6 @@
 import { MuseCircularBuffer } from "./CircularBuffer";
-class Muse {
+
+export class Muse {
   /**
    * Constructs a new instance of the MuseCircularBuffer class.
    *
@@ -390,6 +391,7 @@ class Muse {
     this.state = 2;
   }
 }
+
 /**
  * Connects to a Muse device and returns the connected Muse object.
  *

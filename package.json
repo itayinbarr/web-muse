@@ -1,0 +1,24 @@
+{
+  "name": "web-muse",
+  "version": "1.0.0",
+  "description": "A modern JavaScript library for connecting to Muse EEG devices using Web Bluetooth API.",
+  "homepage": "https://github.com/itayinbarr/web-muse#readme",
+  "bugs": {
+    "url": "https://github.com/itayinbarr/web-muse/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itayinbarr/web-muse.git"
+  },
+  "license": "ISC",
+  "author": "Itay Inbar",
+  "type": "module",
+  "main": "src/lib/MuseDevice.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}

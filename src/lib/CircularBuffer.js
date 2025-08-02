@@ -63,3 +63,5 @@ class MuseCircularBuffer {
     }
   }
 }
+
+export { MuseCircularBuffer };
