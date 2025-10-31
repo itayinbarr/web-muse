@@ -35,11 +35,19 @@ export class MuseBase {
    *
    * @abstract
    * @constructor
+   * @param {Object} options - Configuration options
+   * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
+   * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
    */
-  constructor() {
+  constructor(options = {}) {
     if (new.target === MuseBase) {
       throw new TypeError("Cannot construct MuseBase instances directly");
     }
+    this.mock = options.mock || false;
+    this.mockDataPath = options.mockDataPath || new URL('../../assets/resting-state.csv', import.meta.url).href;
+    this.mockDataIndex = 0;
+    this.mockInterval = null;
+    this.mockData = null;
   }
 
   /**
@@ -330,11 +338,15 @@ export class MuseBase {
   }
   /**
    * Disconnects from the device by calling the `disconnect` method on the `gatt` object of the `dev` property.
+   * In mock mode, stops the data streaming.
    * Sets the `dev` property to `null` and the `state` property to `0`.
    *
    * @return {void} This function does not return a value.
    */
   disconnect() {
+    if (this.mock) {
+      this.#stopMockDataStream();
+    }
     if (this.#dev) this.#dev["gatt"]["disconnect"]();
     this.#dev = null;
     this.#state = 0;
@@ -355,7 +367,143 @@ export class MuseBase {
     return c;
   }
   /**
+   * Loads and parses the mock CSV data file.
+   *
+   * @return {Promise<Array>} A promise that resolves to parsed CSV data.
+   */
+  async #loadMockData() {
+    try {
+      const response = await fetch(this.mockDataPath);
+      const text = await response.text();
+      const lines = text.trim().split('\n');
+      
+      // Skip header line and parse CSV
+      const data = [];
+      for (let i = 1; i < lines.length; i++) {
+        const values = lines[i].split(',');
+        if (values.length >= 5) {
+          data.push({
+            timestamp: parseFloat(values[0]),
+            eeg: [
+              parseFloat(values[1]), // TP9 (left ear)
+              parseFloat(values[2]), // AF7 (left forehead)
+              parseFloat(values[3]), // AF8 (right forehead)
+              parseFloat(values[4])  // TP10 (right ear)
+            ]
+          });
+        }
+      }
+      return data;
+    } catch (error) {
+      console.error('Failed to load mock data:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Starts the mock data streaming.
+   *
+   * @return {void}
+   */
+  #startMockDataStream() {
+    if (!this.mockData || this.mockData.length === 0) {
+      console.error('No mock data available');
+      return;
+    }
+
+    this.mockDataIndex = 0;
+    const that = this;
+
+    // Function to feed the next data point
+    const feedNextSample = () => {
+      if (!that.mock || that.#state !== 2) {
+        return;
+      }
+
+      const currentSample = that.mockData[that.mockDataIndex];
+      const nextIndex = (that.mockDataIndex + 1) % that.mockData.length;
+      const nextSample = that.mockData[nextIndex];
+
+      // Calculate delay to next sample based on timestamps
+      let delay = 4; // Default ~250Hz if timestamps are missing
+      if (currentSample.timestamp && nextSample.timestamp) {
+        delay = nextSample.timestamp - currentSample.timestamp;
+        // Wrap around case
+        if (delay < 0) {
+          delay = 4; // Default delay when looping
+        }
+      }
+
+      // Feed EEG data to each channel
+      for (let i = 0; i < 4; i++) {
+        const mockEvent = {
+          target: {
+            value: that.#createMockEEGData(currentSample.eeg[i])
+          }
+        };
+        that.eegData(i, mockEvent);
+      }
+
+      // Move to next sample
+      that.mockDataIndex = nextIndex;
+
+      // Schedule next sample
+      that.mockInterval = setTimeout(feedNextSample, delay);
+    };
+
+    // Start feeding data
+    feedNextSample();
+  }
+
+  /**
+   * Creates mock EEG data in the format expected by eventEEGData.
+   *
+   * @param {number} value - The EEG value to encode.
+   * @return {DataView} A DataView containing the mock EEG data.
+   */
+  #createMockEEGData(value) {
+    // The eventEEGData method expects 12-bit unsigned data
+    // Convert from scaled value back to 12-bit: value = 0.48828125 * (x - 0x800)
+    // Therefore: x = (value / 0.48828125) + 0x800
+    const unsigned12bit = Math.max(0, Math.min(0xFFF, Math.round((value / 0.48828125) + 0x800)));
+    
+    // Pack into bytes (12 samples = 18 bytes, we'll create 1 sample for simplicity)
+    // Format: each 12-bit sample takes 1.5 bytes
+    // For 12 samples: 18 bytes of data + 2 bytes header
+    const buffer = new ArrayBuffer(20);
+    const view = new DataView(buffer);
+    const uint8 = new Uint8Array(buffer);
+    
+    // Pack 12 identical samples (as the real device sends 12 samples per packet)
+    for (let i = 0; i < 12; i++) {
+      const byteOffset = 2 + Math.floor(i * 1.5);
+      if (i % 2 === 0) {
+        uint8[byteOffset] = (unsigned12bit >> 4) & 0xFF;
+        uint8[byteOffset + 1] = ((unsigned12bit & 0x0F) << 4) | ((unsigned12bit >> 8) & 0x0F);
+      } else {
+        uint8[byteOffset] = (uint8[byteOffset] & 0xF0) | ((unsigned12bit >> 8) & 0x0F);
+        uint8[byteOffset + 1] = unsigned12bit & 0xFF;
+      }
+    }
+    
+    return view;
+  }
+
+  /**
+   * Stops the mock data streaming.
+   *
+   * @return {void}
+   */
+  #stopMockDataStream() {
+    if (this.mockInterval) {
+      clearTimeout(this.mockInterval);
+      this.mockInterval = null;
+    }
+  }
+
+  /**
    * Asynchronously connects to a BLE device and sets up characteristic value change hooks.
+   * In mock mode, loads pre-recorded data instead of connecting to a real device.
    *
    * @return {Promise<void>} A promise that resolves when the connection is established.
    * @throws {Error} If the connection fails at any step.
@@ -365,6 +513,24 @@ export class MuseBase {
       return;
     }
     this.#state = 1;
+
+    // Mock mode: load CSV data and simulate streaming
+    if (this.mock) {
+      try {
+        console.log('Connecting in mock mode...');
+        this.mockData = await this.#loadMockData();
+        console.log(`Loaded ${this.mockData.length} samples from mock data`);
+        this.#state = 2;
+        this.#startMockDataStream();
+        return;
+      } catch (error) {
+        console.error('Failed to connect in mock mode:', error);
+        this.#state = 0;
+        throw error;
+      }
+    }
+
+    // Real device connection
     try {
       this.#dev = await navigator["bluetooth"]["requestDevice"]({
         filters: [{ services: [this.#SERVICE] }],
@@ -458,9 +624,12 @@ export class Muse extends MuseBase {
    * Constructs a new instance of the Muse class.
    *
    * @constructor
+   * @param {Object} options - Configuration options
+   * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
+   * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
    */
-  constructor() {
-    super();
+  constructor(options = {}) {
+    super(options);
     const BUFFER_SIZE = 256;
     this.batteryLevel = null;
     this.info = {};
@@ -571,11 +740,18 @@ export class Muse extends MuseBase {
 /**
  * Connects to a Muse device and returns the connected Muse object.
  *
+ * @param {Object} options - Configuration options
+ * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
+ * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
  * @return {Muse} The connected Muse object.
  */
-export const connectMuse = async () => {
-  const muse = new Muse();
-  console.log("Attempting to connect to Muse...");
+export const connectMuse = async (options = {}) => {
+  const muse = new Muse(options);
+  if (options.mock) {
+    console.log("Attempting to connect to Muse in mock mode...");
+  } else {
+    console.log("Attempting to connect to Muse...");
+  }
   await muse.connect();
   console.log("Muse connected:", muse);
   return muse;

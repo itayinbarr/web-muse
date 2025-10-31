@@ -16,7 +16,7 @@ A modern JavaScript library for connecting to Muse EEG devices using Web Bluetoo
 - Real-time EEG data streaming at 256Hz
 - Built-in signal processing utilities
 - React hooks and context for easy integration
-- Mock data support for development
+- **Mock data mode** for development and testing (no device required!)
 - Support for:
   - EEG data (4 channels)
   - PPG data (3 channels)
@@ -97,6 +97,7 @@ Then run `npm install`
 import { connectMuse } from "web-muse";
 
 async function connectToMuse() {
+  // Connect to a real Muse device
   const muse = await connectMuse();
   console.log("Connected to Muse device:", muse);
 
@@ -105,6 +106,18 @@ async function connectToMuse() {
     const eegData = muse.eeg.map((buffer) => buffer.read());
     console.log("EEG Data:", eegData);
   }, 1000 / 256); // 256Hz sampling rate
+}
+
+// Or use mock mode for development (no device required!)
+async function connectToMuseMock() {
+  const muse = await connectMuse({ mock: true });
+  console.log("Connected in mock mode:", muse);
+
+  // Same API - works identically to real device
+  setInterval(() => {
+    const eegData = muse.eeg.map((buffer) => buffer.read());
+    console.log("Mock EEG Data:", eegData);
+  }, 1000 / 256);
 }
 ```
 
@@ -126,10 +139,21 @@ function App() {
 function YourComponent() {
   const { isConnected, connectMuse, rawEEG } = useEEG();
 
+  const handleConnectReal = async () => {
+    await connectMuse();
+  };
+
+  const handleConnectMock = async () => {
+    await connectMuse({ mock: true });
+  };
+
   return (
     <div>
       {!isConnected ? (
-        <button onClick={connectMuse}>Connect to Muse</button>
+        <>
+          <button onClick={handleConnectReal}>Connect to Real Device</button>
+          <button onClick={handleConnectMock}>Use Mock Data</button>
+        </>
       ) : (
         <div>EEG Data: {JSON.stringify(rawEEG)}</div>
       )}
@@ -137,6 +161,47 @@ function YourComponent() {
   );
 }
 ```
+
+## Mock Mode for Development
+
+Mock mode allows you to develop and test your application without a physical Muse device. It plays back pre-recorded EEG data in a loop, providing realistic data for development and testing.
+
+### Using Mock Mode
+
+**Vanilla JavaScript:**
+```javascript
+import { connectMuse } from "web-muse";
+
+// Connect with mock data
+const muse = await connectMuse({ mock: true });
+
+// Optionally specify a custom CSV file
+const muse = await connectMuse({ 
+  mock: true, 
+  mockDataPath: '/path/to/your/data.csv' 
+});
+```
+
+**Direct Instantiation:**
+```javascript
+import { Muse } from "web-muse";
+
+const muse = new Muse({ mock: true });
+await muse.connect();
+```
+
+### Mock Data Format
+
+The default mock data is located at `assets/resting-state.csv` and contains real EEG recordings from a Muse device. The format is:
+
+```csv
+Timestamp (ms),TP9 (left ear),AF7 (left forehead),AF8 (right forehead),TP10 (right ear)
+5,-0.48828125,0,-0.48828125,-0.48828125
+7,0,-0.48828125,-0.48828125,0
+...
+```
+
+You can provide your own CSV file in the same format for custom mock data scenarios.
 
 ## Development
 
