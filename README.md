@@ -169,6 +169,7 @@ Mock mode allows you to develop and test your application without a physical Mus
 ### Using Mock Mode
 
 **Vanilla JavaScript:**
+
 ```javascript
 import { connectMuse } from "web-muse";
 
@@ -176,13 +177,14 @@ import { connectMuse } from "web-muse";
 const muse = await connectMuse({ mock: true });
 
 // Optionally specify a custom CSV file
-const muse = await connectMuse({ 
-  mock: true, 
-  mockDataPath: '/path/to/your/data.csv' 
+const muse = await connectMuse({
+  mock: true,
+  mockDataPath: "/path/to/your/data.csv",
 });
 ```
 
 **Direct Instantiation:**
+
 ```javascript
 import { Muse } from "web-muse";
 
@@ -238,7 +240,6 @@ Web Bluetooth API is required. Check [browser compatibility](https://caniuse.com
 
 - [API Documentation](./docs/API.md)
 - [Examples](./examples/)
-
 
 ## License
 

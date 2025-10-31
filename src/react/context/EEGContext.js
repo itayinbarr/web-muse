@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
-import { connectMuse, setupPipeline } from "../services/eeg";
+import { connectMuse as connectMuseLib } from "../../lib/MuseDevice";
+import { setupPipeline } from "../../lib/eeg";
 
 const EEGContext = createContext();
 
@@ -11,27 +12,39 @@ export const EEGProvider = ({ children }) => {
   const [isMockData, setIsMockData] = useState(false);
   const [rawEEG, setRawEEG] = useState([]);
 
-  const connectMuseDevice = async () => {
+  /**
+   * Connects to a Muse device (real or mock).
+   * 
+   * @param {Object} options - Connection options
+   * @param {boolean} [options.mock=false] - Enable mock mode
+   * @param {string} [options.mockDataPath] - Path to custom CSV file for mock data
+   */
+  const connectMuse = async (options = {}) => {
     try {
-      const museDevice = await connectMuse();
+      const museDevice = await connectMuseLib(options);
       setMuse(museDevice);
       setIsConnected(true);
-      setIsMockData(false);
+      setIsMockData(options.mock || false);
     } catch (error) {
       console.error("Error connecting to Muse:", error);
+      throw error;
     }
   };
 
   useEffect(() => {
-    if (muse && !isMockData) {
+    if (muse) {
       const cleanup = setupPipeline(muse, setRawEEG);
       return cleanup;
     }
-  }, [muse, isMockData]);
+  }, [muse]);
 
-  const connectMockData = () => {
-    setIsConnected(true);
-    setIsMockData(true);
+  /**
+   * Legacy method for mock data connection.
+   * @deprecated Use connectMuse({ mock: true }) instead
+   */
+  const connectMockData = async () => {
+    console.warn('connectMockData is deprecated. Use connectMuse({ mock: true }) instead.');
+    return connectMuse({ mock: true });
   };
 
   const disconnectEEG = () => {
@@ -48,8 +61,8 @@ export const EEGProvider = ({ children }) => {
     isConnected,
     isMockData,
     rawEEG,
-    connectMuse: connectMuseDevice,
-    connectMockData,
+    connectMuse,
+    connectMockData, // Keep for backward compatibility
     disconnectEEG,
   };
 

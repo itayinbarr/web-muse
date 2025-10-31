@@ -44,7 +44,9 @@ export class MuseBase {
       throw new TypeError("Cannot construct MuseBase instances directly");
     }
     this.mock = options.mock || false;
-    this.mockDataPath = options.mockDataPath || new URL('../../assets/resting-state.csv', import.meta.url).href;
+    this.mockDataPath =
+      options.mockDataPath ||
+      new URL("../../assets/resting-state.csv", import.meta.url).href;
     this.mockDataIndex = 0;
     this.mockInterval = null;
     this.mockData = null;
@@ -375,12 +377,12 @@ export class MuseBase {
     try {
       const response = await fetch(this.mockDataPath);
       const text = await response.text();
-      const lines = text.trim().split('\n');
-      
+      const lines = text.trim().split("\n");
+
       // Skip header line and parse CSV
       const data = [];
       for (let i = 1; i < lines.length; i++) {
-        const values = lines[i].split(',');
+        const values = lines[i].split(",");
         if (values.length >= 5) {
           data.push({
             timestamp: parseFloat(values[0]),
@@ -388,14 +390,14 @@ export class MuseBase {
               parseFloat(values[1]), // TP9 (left ear)
               parseFloat(values[2]), // AF7 (left forehead)
               parseFloat(values[3]), // AF8 (right forehead)
-              parseFloat(values[4])  // TP10 (right ear)
-            ]
+              parseFloat(values[4]), // TP10 (right ear)
+            ],
           });
         }
       }
       return data;
     } catch (error) {
-      console.error('Failed to load mock data:', error);
+      console.error("Failed to load mock data:", error);
       throw error;
     }
   }
@@ -407,7 +409,7 @@ export class MuseBase {
    */
   #startMockDataStream() {
     if (!this.mockData || this.mockData.length === 0) {
-      console.error('No mock data available');
+      console.error("No mock data available");
       return;
     }
 
@@ -438,8 +440,8 @@ export class MuseBase {
       for (let i = 0; i < 4; i++) {
         const mockEvent = {
           target: {
-            value: that.#createMockEEGData(currentSample.eeg[i])
-          }
+            value: that.#createMockEEGData(currentSample.eeg[i]),
+          },
         };
         that.eegData(i, mockEvent);
       }
@@ -465,27 +467,32 @@ export class MuseBase {
     // The eventEEGData method expects 12-bit unsigned data
     // Convert from scaled value back to 12-bit: value = 0.48828125 * (x - 0x800)
     // Therefore: x = (value / 0.48828125) + 0x800
-    const unsigned12bit = Math.max(0, Math.min(0xFFF, Math.round((value / 0.48828125) + 0x800)));
-    
+    const unsigned12bit = Math.max(
+      0,
+      Math.min(0xfff, Math.round(value / 0.48828125 + 0x800))
+    );
+
     // Pack into bytes (12 samples = 18 bytes, we'll create 1 sample for simplicity)
     // Format: each 12-bit sample takes 1.5 bytes
     // For 12 samples: 18 bytes of data + 2 bytes header
     const buffer = new ArrayBuffer(20);
     const view = new DataView(buffer);
     const uint8 = new Uint8Array(buffer);
-    
+
     // Pack 12 identical samples (as the real device sends 12 samples per packet)
     for (let i = 0; i < 12; i++) {
       const byteOffset = 2 + Math.floor(i * 1.5);
       if (i % 2 === 0) {
-        uint8[byteOffset] = (unsigned12bit >> 4) & 0xFF;
-        uint8[byteOffset + 1] = ((unsigned12bit & 0x0F) << 4) | ((unsigned12bit >> 8) & 0x0F);
+        uint8[byteOffset] = (unsigned12bit >> 4) & 0xff;
+        uint8[byteOffset + 1] =
+          ((unsigned12bit & 0x0f) << 4) | ((unsigned12bit >> 8) & 0x0f);
       } else {
-        uint8[byteOffset] = (uint8[byteOffset] & 0xF0) | ((unsigned12bit >> 8) & 0x0F);
-        uint8[byteOffset + 1] = unsigned12bit & 0xFF;
+        uint8[byteOffset] =
+          (uint8[byteOffset] & 0xf0) | ((unsigned12bit >> 8) & 0x0f);
+        uint8[byteOffset + 1] = unsigned12bit & 0xff;
       }
     }
-    
+
     return view;
   }
 
@@ -517,14 +524,14 @@ export class MuseBase {
     // Mock mode: load CSV data and simulate streaming
     if (this.mock) {
       try {
-        console.log('Connecting in mock mode...');
+        console.log("Connecting in mock mode...");
         this.mockData = await this.#loadMockData();
         console.log(`Loaded ${this.mockData.length} samples from mock data`);
         this.#state = 2;
         this.#startMockDataStream();
         return;
       } catch (error) {
-        console.error('Failed to connect in mock mode:', error);
+        console.error("Failed to connect in mock mode:", error);
         this.#state = 0;
         throw error;
       }
@@ -583,30 +590,62 @@ export class MuseBase {
         that.accelerometerData(event);
       }
     );
-    await this.#connectChar(service, this.#PPG1_CHARACTERISTIC, function (event) {
-      that.ppgData(0, event);
-    });
-    await this.#connectChar(service, this.#PPG2_CHARACTERISTIC, function (event) {
-      that.ppgData(1, event);
-    });
-    await this.#connectChar(service, this.#PPG3_CHARACTERISTIC, function (event) {
-      that.ppgData(2, event);
-    });
-    await this.#connectChar(service, this.#EEG1_CHARACTERISTIC, function (event) {
-      that.eegData(0, event);
-    });
-    await this.#connectChar(service, this.#EEG2_CHARACTERISTIC, function (event) {
-      that.eegData(1, event);
-    });
-    await this.#connectChar(service, this.#EEG3_CHARACTERISTIC, function (event) {
-      that.eegData(2, event);
-    });
-    await this.#connectChar(service, this.#EEG4_CHARACTERISTIC, function (event) {
-      that.eegData(3, event);
-    });
-    await this.#connectChar(service, this.#EEG5_CHARACTERISTIC, function (event) {
-      that.eegData(4, event);
-    });
+    await this.#connectChar(
+      service,
+      this.#PPG1_CHARACTERISTIC,
+      function (event) {
+        that.ppgData(0, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#PPG2_CHARACTERISTIC,
+      function (event) {
+        that.ppgData(1, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#PPG3_CHARACTERISTIC,
+      function (event) {
+        that.ppgData(2, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#EEG1_CHARACTERISTIC,
+      function (event) {
+        that.eegData(0, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#EEG2_CHARACTERISTIC,
+      function (event) {
+        that.eegData(1, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#EEG3_CHARACTERISTIC,
+      function (event) {
+        that.eegData(2, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#EEG4_CHARACTERISTIC,
+      function (event) {
+        that.eegData(3, event);
+      }
+    );
+    await this.#connectChar(
+      service,
+      this.#EEG5_CHARACTERISTIC,
+      function (event) {
+        that.eegData(4, event);
+      }
+    );
     await this.#start();
     await this.#sendCommand("v1");
     this.#state = 2;
