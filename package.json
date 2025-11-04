@@ -10,7 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/itayinbarr/web-muse.git"
   },
-  "license": "ISC",
+  "license": "MIT",
   "author": "Itay Inbar",
   "type": "module",
   "main": "src/lib/MuseDevice.js",
