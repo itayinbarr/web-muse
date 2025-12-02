@@ -29,6 +29,7 @@ export class MuseBase {
   #dev = null;
   #controlChar = null;
   #infoFragment = "";
+  #deviceModel = null;
 
   /**
    * Constructs a new interface for connecting to a Muse headband.
@@ -59,6 +60,15 @@ export class MuseBase {
    */
   get state() {
     return this.#state;
+  }
+
+  /**
+   * The detected device model.
+   *
+   * @type {string|null} The device model ('MS-03', 'MU-03', or null if not detected).
+   */
+  get _deviceModel() {
+    return this.#deviceModel;
   }
 
   /**
@@ -131,6 +141,22 @@ export class MuseBase {
   }
 
   /**
+   * Detects the device model from the info object.
+   *
+   * @param {Object} info - The info object containing device information.
+   * @return {string} The detected device model ('MS-03' or 'MU-03').
+   */
+  #detectDeviceModel(info) {
+    const hwString = (info.hw || info.model || info.mp || '').toUpperCase();
+    if (hwString.includes('MS-03') || hwString.includes('CEC3')) {
+      console.log('Detected Muse S (MS-03) device');
+      return 'MS-03';
+    }
+    console.log('Detected Muse 2 (MU-03) device or defaulting to MU-03');
+    return 'MU-03'; // Default to Muse 2
+  }
+
+  /**
    * Decodes unsigned 24-bit data from the given samples array.
    *
    * @param {Array} samples - The array of samples to decode.
@@ -163,6 +189,31 @@ export class MuseBase {
       }
     }
     return samples12Bit;
+  }
+
+  /**
+   * Decodes unsigned 14-bit data from the given samples array.
+   * 14 bits per sample: 7 bytes encode 4 samples.
+   *
+   * @param {Array} samples - The array of samples to decode.
+   * @return {Array} The decoded 14-bit data array.
+   */
+  #decodeUnsigned14BitData(samples) {
+    const samples14Bit = [];
+    // 14 bits per sample: 7 bytes encode 4 samples
+    for (let i = 0; i < samples.length; i += 7) {
+      if (i + 6 < samples.length) {
+        // Sample 0: byte[0] + 6 bits of byte[1]
+        samples14Bit.push((samples[i] << 6) | (samples[i + 1] >> 2));
+        // Sample 1: 2 bits of byte[1] + byte[2] + 4 bits of byte[3]
+        samples14Bit.push(((samples[i + 1] & 0x03) << 12) | (samples[i + 2] << 4) | (samples[i + 3] >> 4));
+        // Sample 2: 4 bits of byte[3] + byte[4] + 2 bits of byte[5]
+        samples14Bit.push(((samples[i + 3] & 0x0f) << 10) | (samples[i + 4] << 2) | (samples[i + 5] >> 6));
+        // Sample 3: 6 bits of byte[5] + byte[6]
+        samples14Bit.push(((samples[i + 5] & 0x3f) << 8) | samples[i + 6]);
+      }
+    }
+    return samples14Bit;
   }
 
   /**
@@ -268,6 +319,10 @@ export class MuseBase {
         for (const key in tmp) {
           info[key] = tmp[key];
         }
+        // Detect device model if not already detected and info contains identifying fields
+        if (!this.#deviceModel && Object.keys(tmp).length > 0) {
+          this.#deviceModel = this.#detectDeviceModel(tmp);
+        }
       }
     }
     return info;
@@ -277,14 +332,19 @@ export class MuseBase {
    * Returns the EEG data from a given event.
    *
    * @param {object} event - The event containing the EEG data.
-   * @return {number[]} An array of samples, each a number between 0 and 2^12.
+   * @return {number[]} An array of samples, each a number between 0 and 2^12 (Muse 2) or 2^14 (MS-03).
    */
   eventEEGData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
-    return this.#decodeUnsigned12BitData(
-      new Uint8Array(data.buffer).subarray(2)
-    );
+    const bytes = new Uint8Array(data.buffer).subarray(2);
+
+    // Use appropriate decoder based on device model
+    if (this.#deviceModel === 'MS-03') {
+      return this.#decodeUnsigned14BitData(bytes);
+    } else {
+      return this.#decodeUnsigned12BitData(bytes);
+    }
   }
 
   /**
@@ -327,14 +387,19 @@ export class MuseBase {
     await this.#sendCommand("d");
   }
   /**
-   * Starts the process by pausing, sending a command to set the priority to 50,
+   * Starts the process by pausing, sending the appropriate preset command,
    * sending a command to start, and resuming.
    *
    * @return {Promise<void>} A promise that resolves when the process is started.
    */
   async #start() {
     await this.#pause();
-    await this.#sendCommand("p50");
+
+    // Select preset based on device model
+    const preset = this.#deviceModel === 'MS-03' ? 'p1021' : 'p50';
+    console.log(`Using preset ${preset} for device model ${this.#deviceModel}`);
+    await this.#sendCommand(preset);
+
     await this.#sendCommand("s");
     await this.#resume();
   }
@@ -569,6 +634,27 @@ export class MuseBase {
         that.controlData(event);
       }
     );
+
+    // Wait for device model detection (with timeout)
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn('Device detection timeout, defaulting to MU-03');
+        if (!that.#deviceModel) {
+          that.#deviceModel = 'MU-03';
+        }
+        resolve();
+      }, 2000);
+
+      const checkModel = setInterval(() => {
+        if (that.#deviceModel) {
+          clearTimeout(timeout);
+          clearInterval(checkModel);
+          console.log(`Device model detected: ${that.#deviceModel}`);
+          resolve();
+        }
+      }, 100);
+    });
+
     await this.#connectChar(
       service,
       this.#BATTERY_CHARACTERISTIC,
@@ -590,27 +676,38 @@ export class MuseBase {
         that.accelerometerData(event);
       }
     );
-    await this.#connectChar(
-      service,
-      this.#PPG1_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(0, event);
+
+    // Only connect PPG for Muse 2 devices (MS-03 doesn't have PPG)
+    if (this.#deviceModel !== 'MS-03') {
+      try {
+        await this.#connectChar(
+          service,
+          this.#PPG1_CHARACTERISTIC,
+          function (event) {
+            that.ppgData(0, event);
+          }
+        );
+        await this.#connectChar(
+          service,
+          this.#PPG2_CHARACTERISTIC,
+          function (event) {
+            that.ppgData(1, event);
+          }
+        );
+        await this.#connectChar(
+          service,
+          this.#PPG3_CHARACTERISTIC,
+          function (event) {
+            that.ppgData(2, event);
+          }
+        );
+        console.log('PPG characteristics connected');
+      } catch (e) {
+        console.warn('PPG characteristics not available:', e.message);
       }
-    );
-    await this.#connectChar(
-      service,
-      this.#PPG2_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(1, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#PPG3_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(2, event);
-      }
-    );
+    } else {
+      console.log('Skipping PPG characteristics for MS-03 device');
+    }
     await this.#connectChar(
       service,
       this.#EEG1_CHARACTERISTIC,
@@ -695,6 +792,32 @@ export class Muse extends MuseBase {
       new MuseCircularBuffer(BUFFER_SIZE),
     ];
   }
+
+  /**
+   * Gets the detected device model.
+   *
+   * @return {string|null} The device model ('MS-03', 'MU-03', or null if not detected).
+   */
+  get deviceModel() {
+    return this._deviceModel;
+  }
+
+  /**
+   * Gets the device capabilities based on the detected model.
+   *
+   * @return {Object} An object containing device capabilities information.
+   */
+  get capabilities() {
+    const model = this.deviceModel || 'Unknown';
+    return {
+      model: model,
+      eegChannels: 4,
+      eegBitDepth: model === 'MS-03' ? 14 : 12,
+      hasPPG: model !== 'MS-03',
+      hasOptics: false, // Not implemented yet
+      preset: model === 'MS-03' ? 'p1021' : 'p50'
+    };
+  }
   /**
    * Updates the battery level based on the received event.
    *
@@ -746,7 +869,7 @@ export class Muse extends MuseBase {
   }
   /**
    * Processes EEG data from the given event, scales it to the range [-1000, 1000),
-   * and writes it to the corresponding PPG circular buffer.
+   * and writes it to the corresponding EEG circular buffer.
    *
    * @param {number} n - The index of the EEG channel.
    * @param {Event} event - The event containing the EEG data.
@@ -754,9 +877,14 @@ export class Muse extends MuseBase {
    */
   eegData(n, event) {
     let samples = this.eventEEGData(event);
-    samples = samples.map(function (x) {
-      return 0.48828125 * (x - 0x800);
-    });
+
+    // Determine scaling based on device model
+    const is14Bit = this.deviceModel === 'MS-03';
+    const offset = is14Bit ? 0x2000 : 0x800;
+    const scale = is14Bit ? 0.48828125 / 4 : 0.48828125;
+
+    samples = samples.map(x => scale * (x - offset));
+
     for (let i = 0; i < samples.length; i++) {
       this.eeg[n].write(samples[i]);
     }
