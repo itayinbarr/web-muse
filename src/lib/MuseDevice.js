@@ -1,4 +1,4 @@
-import { MuseCircularBuffer } from "./CircularBuffer";
+import { MuseCircularBuffer } from "./CircularBuffer.js";
 
 /**
  * An abstract base class for interfaces that connect to a Muse headband.
@@ -147,7 +147,7 @@ export class MuseBase {
    * @return {string} The detected device model ('MS-03' or 'MU-03').
    */
   #detectDeviceModel(info) {
-    const hwString = (info.hw || info.model || info.mp || '').toUpperCase();
+    const hwString = String(info.hw || info.model || info.mp || "").toUpperCase();
     if (hwString.includes('MS-03') || hwString.includes('CEC3')) {
       console.log('Detected Muse S (MS-03) device');
       return 'MS-03';
@@ -627,6 +627,19 @@ export class MuseBase {
       this.#state = 0;
       that.disconnected();
     });
+
+    // Discover all available characteristics
+    console.log('Discovering available characteristics...');
+    try {
+      const allChars = await service.getCharacteristics();
+      console.log(`Found ${allChars.length} characteristics:`);
+      allChars.forEach((char, idx) => {
+        console.log(`  ${idx + 1}. ${char.uuid}`);
+      });
+    } catch (e) {
+      console.warn('Could not enumerate characteristics:', e);
+    }
+
     this.#controlChar = await this.#connectChar(
       service,
       this.#CONTROL_CHARACTERISTIC,
@@ -655,27 +668,45 @@ export class MuseBase {
       }, 100);
     });
 
-    await this.#connectChar(
-      service,
-      this.#BATTERY_CHARACTERISTIC,
-      function (event) {
-        that.batteryData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#GYROSCOPE_CHARACTERISTIC,
-      function (event) {
-        that.gyroscopeData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#ACCELEROMETER_CHARACTERISTIC,
-      function (event) {
-        that.accelerometerData(event);
-      }
-    );
+    // Connect to optional characteristics (may not exist on all devices)
+    try {
+      await this.#connectChar(
+        service,
+        this.#BATTERY_CHARACTERISTIC,
+        function (event) {
+          that.batteryData(event);
+        }
+      );
+      console.log('Battery characteristic connected');
+    } catch (e) {
+      console.warn('Battery characteristic not available');
+    }
+
+    try {
+      await this.#connectChar(
+        service,
+        this.#GYROSCOPE_CHARACTERISTIC,
+        function (event) {
+          that.gyroscopeData(event);
+        }
+      );
+      console.log('Gyroscope characteristic connected');
+    } catch (e) {
+      console.warn('Gyroscope characteristic not available');
+    }
+
+    try {
+      await this.#connectChar(
+        service,
+        this.#ACCELEROMETER_CHARACTERISTIC,
+        function (event) {
+          that.accelerometerData(event);
+        }
+      );
+      console.log('Accelerometer characteristic connected');
+    } catch (e) {
+      console.warn('Accelerometer characteristic not available');
+    }
 
     // Only connect PPG for Muse 2 devices (MS-03 doesn't have PPG)
     if (this.#deviceModel !== 'MS-03') {
@@ -708,41 +739,31 @@ export class MuseBase {
     } else {
       console.log('Skipping PPG characteristics for MS-03 device');
     }
-    await this.#connectChar(
-      service,
+
+    // Connect EEG characteristics (try each one, some may not exist)
+    const eegChars = [
       this.#EEG1_CHARACTERISTIC,
-      function (event) {
-        that.eegData(0, event);
-      }
-    );
-    await this.#connectChar(
-      service,
       this.#EEG2_CHARACTERISTIC,
-      function (event) {
-        that.eegData(1, event);
-      }
-    );
-    await this.#connectChar(
-      service,
       this.#EEG3_CHARACTERISTIC,
-      function (event) {
-        that.eegData(2, event);
-      }
-    );
-    await this.#connectChar(
-      service,
       this.#EEG4_CHARACTERISTIC,
-      function (event) {
-        that.eegData(3, event);
-      }
-    );
-    await this.#connectChar(
-      service,
       this.#EEG5_CHARACTERISTIC,
-      function (event) {
-        that.eegData(4, event);
+    ];
+
+    for (let i = 0; i < eegChars.length; i++) {
+      try {
+        await this.#connectChar(
+          service,
+          eegChars[i],
+          function (event) {
+            that.eegData(i, event);
+          }
+        );
+        console.log(`EEG${i + 1} characteristic connected`);
+      } catch (e) {
+        console.warn(`EEG${i + 1} characteristic not available`);
       }
-    );
+    }
+
     await this.#start();
     await this.#sendCommand("v1");
     this.#state = 2;

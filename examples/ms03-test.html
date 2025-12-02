@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Muse MS-03 Test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #0c1b2a;
+      --panel: #10253b;
+      --accent: #27c3ff;
+      --muted: #8aa6bf;
+      --text: #e8f1f8;
+      --grid: rgba(255, 255, 255, 0.06);
+      font-family: "Helvetica Neue", "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: radial-gradient(circle at 20% 20%, #15365a, #0c1b2a 45%),
+        radial-gradient(circle at 80% 10%, #102f4d, transparent 35%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), #1a91d8);
+      color: #04101f;
+      font-weight: 700;
+      padding: 12px 18px;
+      cursor: pointer;
+      box-shadow: 0 10px 30px rgba(39, 195, 255, 0.25);
+      transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 40px rgba(39, 195, 255, 0.3);
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin-top: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border-radius: 14px;
+      padding: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+    }
+    .label {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .value {
+      font-size: 18px;
+      font-weight: 700;
+    }
+    pre {
+      background: #0a1726;
+      color: #c5e1ff;
+      border-radius: 10px;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      max-height: 240px;
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    textarea {
+      width: 100%;
+      min-height: 140px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: #0a1726;
+      color: #c5e1ff;
+      border-radius: 10px;
+      padding: 10px;
+      resize: vertical;
+      font-family: "SF Mono", "Consolas", "Menlo", monospace;
+      box-sizing: border-box;
+    }
+    .top-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .charts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    canvas {
+      width: 100%;
+      height: 150px;
+      background: linear-gradient(#0f2237, #0d1c2e);
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+    .status-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 6px;
+      background: #b63f3f;
+      vertical-align: middle;
+    }
+    .status-dot.connected {
+      background: #5ae2a1;
+      box-shadow: 0 0 10px rgba(90, 226, 161, 0.6);
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="top-actions">
+    <h1>Muse MS-03 Quick Test</h1>
+    <button id="connect-btn">Connect</button>
+    <span id="status"><span class="status-dot" id="status-dot"></span><span id="status-text">Not connected</span></span>
+  </div>
+  <p>Use Chrome/Edge on localhost (HTTPS or localhost required). Click Connect, select your Muse, then watch live EEG values. Use “Copy Summary” to share results.</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Device Model</div>
+      <div class="value" id="model">—</div>
+      <div class="label" style="margin-top:10px;">Capabilities</div>
+      <pre id="capabilities">—</pre>
+    </div>
+    <div class="card">
+      <div class="label">Info (raw)</div>
+      <pre id="info">—</pre>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <div class="row" style="margin-bottom:8px;">
+      <div class="label" style="margin:0;">Copyable Summary</div>
+      <button id="copy-btn" style="margin-left:auto;">Copy Summary</button>
+    </div>
+    <textarea id="summary" readonly></textarea>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <div class="label" style="margin-bottom:8px;">EEG Channels (latest samples)</div>
+    <div class="charts" id="charts"></div>
+  </div>
+
+  <script type="module">
+    import { connectMuse } from "../src/lib/MuseDevice.js";
+
+    const connectBtn = document.getElementById("connect-btn");
+    const statusText = document.getElementById("status-text");
+    const statusDot = document.getElementById("status-dot");
+    const modelEl = document.getElementById("model");
+    const capabilitiesEl = document.getElementById("capabilities");
+    const infoEl = document.getElementById("info");
+    const summaryEl = document.getElementById("summary");
+    const copyBtn = document.getElementById("copy-btn");
+    const chartsEl = document.getElementById("charts");
+
+    const MAX_POINTS = 256;
+    const eegSeries = [[], [], [], []];
+    const canvases = [];
+    const contexts = [];
+    let muse = null;
+
+    function setStatus(text, connected = false) {
+      statusText.textContent = text;
+      statusDot.classList.toggle("connected", connected);
+    }
+
+    function createCharts() {
+      chartsEl.innerHTML = "";
+      canvases.length = 0;
+      contexts.length = 0;
+      for (let i = 0; i < 4; i++) {
+        const canvas = document.createElement("canvas");
+        canvas.width = 400;
+        canvas.height = 150;
+        canvas.dataset.channel = i;
+        canvases.push(canvas);
+        contexts.push(canvas.getContext("2d"));
+        chartsEl.appendChild(canvas);
+      }
+    }
+
+    function drawChannel(idx) {
+      const ctx = contexts[idx];
+      const data = eegSeries[idx];
+      if (!ctx || data.length === 0) {
+        return;
+      }
+
+      const w = ctx.canvas.width;
+      const h = ctx.canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      // grid lines
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < w; x += 40) {
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, h);
+        ctx.stroke();
+      }
+      for (let y = 0; y < h; y += 30) {
+        ctx.beginPath();
+        ctx.moveTo(0, y + 0.5);
+        ctx.lineTo(w, y + 0.5);
+        ctx.stroke();
+      }
+
+      const maxAbs = Math.max(50, Math.max(...data.map((d) => Math.abs(d))));
+      const scaleY = (h / 2 - 10) / maxAbs;
+      ctx.strokeStyle = "#27c3ff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = (i / (MAX_POINTS - 1)) * w;
+        const y = h / 2 - v * scaleY;
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+
+      ctx.fillStyle = "rgba(39,195,255,0.8)";
+      ctx.font = "12px \"SF Mono\", \"Consolas\", monospace";
+      ctx.fillText(`Ch ${idx + 1} | latest ${data[data.length - 1].toFixed(2)} µV`, 10, 18);
+    }
+
+    function updateSummary() {
+      const latest = eegSeries.map((series) =>
+        series.length ? series[series.length - 1] : null
+      );
+      const payload = {
+        deviceModel: muse?.deviceModel || null,
+        capabilities: muse?.capabilities || null,
+        info: muse?.info || null,
+        latestEEG: latest,
+        timestamp: new Date().toISOString(),
+      };
+      summaryEl.value = JSON.stringify(payload, null, 2);
+    }
+
+    function pumpEEG() {
+      if (!muse) return;
+      for (let i = 0; i < 4; i++) {
+        let sample;
+        // Drain the buffer so the chart uses the most recent values
+        while ((sample = muse.eeg[i].read()) !== null) {
+          eegSeries[i].push(sample);
+        }
+        // fallback to the last stored value if nothing new arrived
+        if (eegSeries[i].length === 0 && muse.eeg[i].length > 0) {
+          const latest = muse.eeg[i].memory[muse.eeg[i].head];
+          eegSeries[i].push(latest);
+        }
+        if (eegSeries[i].length > MAX_POINTS) {
+          eegSeries[i].splice(0, eegSeries[i].length - MAX_POINTS);
+        }
+        drawChannel(i);
+      }
+      updateSummary();
+    }
+
+    async function handleConnect() {
+      connectBtn.disabled = true;
+      setStatus("Requesting device...");
+      try {
+        createCharts();
+        muse = await connectMuse();
+        setStatus("Connected", true);
+        modelEl.textContent = muse.deviceModel || "Detecting...";
+        capabilitiesEl.textContent = JSON.stringify(muse.capabilities, null, 2);
+        infoEl.textContent = JSON.stringify(muse.info, null, 2);
+
+        // Update info as control data arrives
+        const originalControl = muse.controlData.bind(muse);
+        muse.controlData = (evt) => {
+          originalControl(evt);
+          modelEl.textContent = muse.deviceModel || "Detecting...";
+          capabilitiesEl.textContent = JSON.stringify(muse.capabilities, null, 2);
+          infoEl.textContent = JSON.stringify(muse.info, null, 2);
+          updateSummary();
+        };
+
+        setInterval(pumpEEG, 50);
+      } catch (err) {
+        console.error(err);
+        setStatus("Connection failed");
+        alert("Connection failed: " + err.message);
+      } finally {
+        connectBtn.disabled = false;
+      }
+    }
+
+    connectBtn.addEventListener("click", handleConnect);
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(summaryEl.value);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => (copyBtn.textContent = "Copy Summary"), 1200);
+      } catch (err) {
+        alert("Clipboard failed: " + err.message);
+      }
+    });
+
+    // Prepare empty charts
+    createCharts();
+  </script>
+</body>
+</html>
