@@ -309,19 +309,32 @@ export class MuseBase {
     data = data.buffer ? data : new DataView(data);
     const buf = new Uint8Array(data.buffer);
     const str = this.#decodeInfo(buf);
+
+    // Log all control data for debugging
+    console.log(`[Control] Raw bytes: [${Array.from(buf).slice(0, 20).join(', ')}${buf.length > 20 ? '...' : ''}]`);
+    console.log(`[Control] Decoded string: "${str}"`);
+
     let info = {};
     for (let i = 0; i < str.length; i++) {
       const c = str[i];
       this.#infoFragment = this.#infoFragment + c;
       if (c === "}") {
-        const tmp = JSON.parse(this.#infoFragment);
-        this.#infoFragment = "";
-        for (const key in tmp) {
-          info[key] = tmp[key];
-        }
-        // Detect device model if not already detected and info contains identifying fields
-        if (!this.#deviceModel && Object.keys(tmp).length > 0) {
-          this.#deviceModel = this.#detectDeviceModel(tmp);
+        try {
+          const tmp = JSON.parse(this.#infoFragment);
+          console.log('[Control] Parsed JSON:', tmp);
+          this.#infoFragment = "";
+          for (const key in tmp) {
+            info[key] = tmp[key];
+          }
+          // Detect device model if not already detected and info contains identifying fields
+          if (!this.#deviceModel && Object.keys(tmp).length > 0) {
+            this.#deviceModel = this.#detectDeviceModel(tmp);
+          }
+        } catch (e) {
+          // Invalid JSON, likely incomplete or corrupted fragment
+          // Reset fragment and continue
+          console.warn('[Control] Failed to parse JSON:', this.#infoFragment, e.message);
+          this.#infoFragment = "";
         }
       }
     }
@@ -339,9 +352,20 @@ export class MuseBase {
     data = data.buffer ? data : new DataView(data);
     const bytes = new Uint8Array(data.buffer).subarray(2);
 
+    // Debug logging for first few packets
+    if (!this._eegDebugCount) this._eegDebugCount = 0;
+    if (this._eegDebugCount < 3) {
+      console.log(`[EEG Debug] Packet ${this._eegDebugCount}: ${bytes.length} bytes, first 10:`, Array.from(bytes.slice(0, 10)));
+      this._eegDebugCount++;
+    }
+
     // Use appropriate decoder based on device model
     if (this.#deviceModel === 'MS-03') {
-      return this.#decodeUnsigned14BitData(bytes);
+      const decoded = this.#decodeUnsigned14BitData(bytes);
+      if (this._eegDebugCount <= 3) {
+        console.log(`[EEG Debug] Decoded 14-bit samples (first 5):`, decoded.slice(0, 5));
+      }
+      return decoded;
     } else {
       return this.#decodeUnsigned12BitData(bytes);
     }
@@ -368,6 +392,7 @@ export class MuseBase {
    * @return {Promise<void>} A promise that resolves when the command has been sent.
    */
   async #sendCommand(cmd) {
+    console.log(`Sending command: "${cmd}"`);
     await this.#controlChar["writeValue"](this.#encodeCommand(cmd));
   }
   /**
@@ -396,7 +421,8 @@ export class MuseBase {
     await this.#pause();
 
     // Select preset based on device model
-    const preset = this.#deviceModel === 'MS-03' ? 'p1021' : 'p50';
+    // MS-03: Try p1031 (4CH EEG + Optics) which might activate the available characteristics
+    const preset = this.#deviceModel === 'MS-03' ? 'p1031' : 'p50';
     console.log(`Using preset ${preset} for device model ${this.#deviceModel}`);
     await this.#sendCommand(preset);
 
@@ -430,7 +456,8 @@ export class MuseBase {
   async #connectChar(service, cid, hook) {
     const c = await service["getCharacteristic"](cid);
     c["oncharacteristicvaluechanged"] = hook;
-    c["startNotifications"]();
+    await c["startNotifications"]();
+    console.log(`Notifications started for ${cid.substring(0, 13)}...`);
     return c;
   }
   /**
@@ -630,12 +657,28 @@ export class MuseBase {
 
     // Discover all available characteristics
     console.log('Discovering available characteristics...');
+    const availableCharUUIDs = new Set();
     try {
       const allChars = await service.getCharacteristics();
       console.log(`Found ${allChars.length} characteristics:`);
       allChars.forEach((char, idx) => {
-        console.log(`  ${idx + 1}. ${char.uuid}`);
+        const uuid = char.uuid.toLowerCase();
+        availableCharUUIDs.add(uuid);
+        console.log(`  ${idx + 1}. ${uuid}`);
       });
+
+      // Detect MS-03 based on characteristic signature
+      // MS-03 has 273e0013, 273e0014, 273e0015 but NOT the standard 0x0003-0x0007
+      const hasMS03Chars = availableCharUUIDs.has('273e0013-4c4d-454d-96be-f03bac821358');
+      const hasStandardEEG = availableCharUUIDs.has('273e0003-4c4d-454d-96be-f03bac821358');
+
+      if (hasMS03Chars && !hasStandardEEG) {
+        console.log('Detected MS-03 based on characteristic signature');
+        this.#deviceModel = 'MS-03';
+      } else if (hasStandardEEG) {
+        console.log('Detected MU-03 based on characteristic signature');
+        this.#deviceModel = 'MU-03';
+      }
     } catch (e) {
       console.warn('Could not enumerate characteristics:', e);
     }
@@ -648,25 +691,29 @@ export class MuseBase {
       }
     );
 
-    // Wait for device model detection (with timeout)
-    await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        console.warn('Device detection timeout, defaulting to MU-03');
-        if (!that.#deviceModel) {
-          that.#deviceModel = 'MU-03';
-        }
-        resolve();
-      }, 2000);
-
-      const checkModel = setInterval(() => {
-        if (that.#deviceModel) {
-          clearTimeout(timeout);
-          clearInterval(checkModel);
-          console.log(`Device model detected: ${that.#deviceModel}`);
+    // Wait for device model detection (with short timeout since we detect from characteristics)
+    if (!that.#deviceModel) {
+      await new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          console.warn('Device detection timeout, defaulting to MU-03');
+          if (!that.#deviceModel) {
+            that.#deviceModel = 'MU-03';
+          }
           resolve();
-        }
-      }, 100);
-    });
+        }, 500);
+
+        const checkModel = setInterval(() => {
+          if (that.#deviceModel) {
+            clearTimeout(timeout);
+            clearInterval(checkModel);
+            console.log(`Device model confirmed: ${that.#deviceModel}`);
+            resolve();
+          }
+        }, 50);
+      });
+    } else {
+      console.log(`Device model already detected: ${that.#deviceModel}`);
+    }
 
     // Connect to optional characteristics (may not exist on all devices)
     try {
@@ -740,27 +787,52 @@ export class MuseBase {
       console.log('Skipping PPG characteristics for MS-03 device');
     }
 
-    // Connect EEG characteristics (try each one, some may not exist)
-    const eegChars = [
-      this.#EEG1_CHARACTERISTIC,
-      this.#EEG2_CHARACTERISTIC,
-      this.#EEG3_CHARACTERISTIC,
-      this.#EEG4_CHARACTERISTIC,
-      this.#EEG5_CHARACTERISTIC,
-    ];
+    // Connect EEG characteristics based on device model
+    if (this.#deviceModel === 'MS-03') {
+      // MS-03 uses different UUIDs - try all available data characteristics
+      const ms03DataChars = [
+        '273e0013-4c4d-454d-96be-f03bac821358', // Data channel 0
+        '273e0014-4c4d-454d-96be-f03bac821358', // Data channel 1
+        '273e0015-4c4d-454d-96be-f03bac821358', // Data channel 2 (might be optics or EEG)
+      ];
 
-    for (let i = 0; i < eegChars.length; i++) {
-      try {
-        await this.#connectChar(
-          service,
-          eegChars[i],
-          function (event) {
-            that.eegData(i, event);
-          }
-        );
-        console.log(`EEG${i + 1} characteristic connected`);
-      } catch (e) {
-        console.warn(`EEG${i + 1} characteristic not available`);
+      for (let i = 0; i < ms03DataChars.length; i++) {
+        try {
+          await this.#connectChar(
+            service,
+            ms03DataChars[i],
+            function (event) {
+              that.eegData(i, event);
+            }
+          );
+          console.log(`MS-03 data channel ${i} (${ms03DataChars[i]}) connected`);
+        } catch (e) {
+          console.warn(`MS-03 data channel ${i} not available:`, e.message);
+        }
+      }
+    } else {
+      // Standard Muse 2 EEG characteristics
+      const eegChars = [
+        this.#EEG1_CHARACTERISTIC,
+        this.#EEG2_CHARACTERISTIC,
+        this.#EEG3_CHARACTERISTIC,
+        this.#EEG4_CHARACTERISTIC,
+        this.#EEG5_CHARACTERISTIC,
+      ];
+
+      for (let i = 0; i < eegChars.length; i++) {
+        try {
+          await this.#connectChar(
+            service,
+            eegChars[i],
+            function (event) {
+              that.eegData(i, event);
+            }
+          );
+          console.log(`EEG${i + 1} characteristic connected`);
+        } catch (e) {
+          console.warn(`EEG${i + 1} characteristic not available`);
+        }
       }
     }
 
