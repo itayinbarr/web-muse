@@ -66,12 +66,37 @@ export class MuseBase {
       throw new TypeError("Cannot construct MuseBase instances directly");
     }
     this.mock = options.mock || false;
-    this.mockDataPath =
-      options.mockDataPath ||
-      new URL("../../assets/resting-state.csv", import.meta.url).href;
+    const defaultMockDataPath = new URL(
+      "../../assets/resting-state.csv",
+      import.meta.url,
+    ).href;
+    this.mockDataPath = options.mockDataPath
+      ? MuseBase.#sanitizeMockDataPath(options.mockDataPath)
+      : defaultMockDataPath;
     this.mockDataIndex = 0;
     this.mockInterval = null;
     this.mockData = null;
+  }
+
+  /**
+   * Ensures a user-supplied mockDataPath resolves inside the bundled assets
+   * directory, preventing path traversal or fetches of arbitrary URLs.
+   *
+   * @param {string} path - The candidate mock data path.
+   * @return {string} The validated, resolved URL href.
+   */
+  static #sanitizeMockDataPath(path) {
+    const assetsDir = new URL("../../assets/", import.meta.url);
+    const resolved = new URL(path, assetsDir);
+    if (
+      resolved.protocol !== assetsDir.protocol ||
+      !resolved.href.startsWith(assetsDir.href)
+    ) {
+      throw new TypeError(
+        "Invalid mockDataPath: must resolve within the assets directory",
+      );
+    }
+    return resolved.href;
   }
 
   /**
