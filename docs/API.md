@@ -66,8 +66,35 @@ await muse.connect();
 
 #### Methods
 
-- `connect()`: Initiates connection to the device (or loads mock data in mock mode)
+- `connect()`: Initiates connection to the device (or loads mock data in mock mode). Rejects if the device picker is cancelled or the connection fails.
 - `disconnect()`: Disconnects from the device (or stops mock data stream)
+- `onEEG(callback)`: Subscribes to EEG packets; returns an unsubscribe function. See below.
+- `offEEG(callback)`: Removes an `onEEG` subscription.
+- `onDisconnect(callback)`: Called once whenever the device disconnects, whether through `disconnect()` or because the headband went away. Returns an unsubscribe function.
+
+#### Streaming every sample with `onEEG`
+
+The circular buffers hold one second of data and drop new samples when full, so
+polling them can lose data. For recording, subscribe to packets instead:
+
+```javascript
+import { connectMuse, EEG_CHANNEL_NAMES } from "web-muse";
+
+const muse = await connectMuse();
+const unsubscribe = muse.onEEG(({ channel, seq, samples, receivedAt }) => {
+  // channel:    0=TP9, 1=AF7, 2=AF8, 3=TP10, 4=AUX
+  // seq:        16-bit packet sequence number from the device
+  // samples:    12 samples in microvolts
+  // receivedAt: performance.now() when the packet arrived
+  console.log(EEG_CHANNEL_NAMES[channel], seq, samples);
+});
+```
+
+Sample `i` of a packet has the absolute index `seq * 12 + i` (the sequence
+number wraps at 65536). Gaps in `seq` mean dropped packets, and fitting
+`receivedAt` against sample index gives each sample a timestamp without
+Bluetooth jitter. The library also exports `EEG_SAMPLE_RATE` (256),
+`EEG_SAMPLES_PER_PACKET` (12), `EEG_CHANNEL_NAMES` and `eegToMicrovolts`.
 
 ### EEG Processing
 
@@ -149,7 +176,7 @@ Mock mode allows development and testing without a physical Muse device. When en
 ### Features
 
 - **No device required**: Perfect for development and testing
-- **Realistic timing**: Respects original timestamps from recordings
+- **Realistic timing**: Streams like the device: packets of 12 samples per channel at 256 Hz with incrementing sequence numbers (the CSV is assumed to be recorded at 256 Hz; its timestamp column is not used for pacing)
 - **Seamless API**: Works identically to real device connection
 - **Custom data**: Support for custom CSV files
 

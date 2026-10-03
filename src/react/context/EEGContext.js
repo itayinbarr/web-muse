@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
-import { connectMuse as connectMuseLib } from "../../lib/MuseDevice";
-import { setupPipeline } from "../../lib/eeg";
+import { connectMuse as connectMuseLib } from "../../lib/MuseDevice.js";
+import { setupPipeline } from "../../lib/eeg.js";
 
 const EEGContext = createContext();
 
@@ -36,6 +36,17 @@ export const EEGProvider = ({ children }) => {
       const cleanup = setupPipeline(muse, setRawEEG);
       return cleanup;
     }
+  }, [muse]);
+
+  // Reflect disconnections that were not requested, e.g. the headband
+  // turning off or going out of range.
+  useEffect(() => {
+    if (!muse) return;
+    return muse.onDisconnect(() => {
+      setMuse(null);
+      setIsConnected(false);
+      setIsMockData(false);
+    });
   }, [muse]);
 
   /**

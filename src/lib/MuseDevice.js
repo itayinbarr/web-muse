@@ -1,4 +1,19 @@
-import { MuseCircularBuffer } from "./CircularBuffer";
+import { MuseCircularBuffer } from "./CircularBuffer.js";
+
+/** EEG sampling rate of Muse headbands, in Hz. */
+export const EEG_SAMPLE_RATE = 256;
+/** Number of samples per channel in each EEG packet. */
+export const EEG_SAMPLES_PER_PACKET = 12;
+/** EEG channel names, by characteristic index. */
+export const EEG_CHANNEL_NAMES = ["TP9", "AF7", "AF8", "TP10", "AUX"];
+
+/**
+ * Converts a raw unsigned 12-bit EEG sample to microvolts.
+ *
+ * @param {number} x - A raw sample between 0 and 2^12.
+ * @return {number} The sample in microvolts, in the range [-1000, 1000).
+ */
+export const eegToMicrovolts = (x) => 0.48828125 * (x - 0x800);
 
 /**
  * An abstract base class for interfaces that connect to a Muse headband.
@@ -10,6 +25,9 @@ import { MuseCircularBuffer } from "./CircularBuffer";
  * - eegData           - called when an event with EEG data is received (use eventEegData to get it)
  * - ppgData           - called when an event with PPG data is received (use eventPpgData to get it)
  * - disconnected      - called when the Muse headband is disconnected
+ *
+ * Consumers that need every EEG sample with timing information can instead
+ * subscribe with `onEEG(callback)`, which receives one packet per call.
  */
 export class MuseBase {
   #SERVICE = 0xfe8d;
@@ -29,6 +47,10 @@ export class MuseBase {
   #dev = null;
   #controlChar = null;
   #infoFragment = "";
+  #eegListeners = new Set();
+  #disconnectListeners = new Set();
+  #onGattDisconnected = null;
+  #mockSeq = 0;
 
   /**
    * Constructs a new interface for connecting to a Muse headband.
@@ -119,6 +141,100 @@ export class MuseBase {
    * @return {void} This function does not return a value.
    */
   disconnected() {}
+
+  /**
+   * Subscribes to EEG packets. The callback is called once per packet with
+   * `{ channel, seq, samples, receivedAt }`, where `channel` is the EEG
+   * characteristic index (0=TP9, 1=AF7, 2=AF8, 3=TP10, 4=AUX), `seq` is the
+   * device's 16-bit packet sequence number, `samples` holds 12 values in
+   * microvolts, and `receivedAt` is the `performance.now()` arrival time.
+   *
+   * Sample `i` of a packet has the absolute index `seq * 12 + i` (modulo the
+   * 16-bit wraparound of `seq`), which lets consumers detect dropped packets
+   * and reconstruct sample timing independently of Bluetooth jitter.
+   *
+   * @param {Function} callback - Called with each EEG packet.
+   * @return {Function} A function that removes the subscription.
+   */
+  onEEG(callback) {
+    this.#eegListeners.add(callback);
+    return () => this.offEEG(callback);
+  }
+
+  /**
+   * Removes a callback previously registered with `onEEG`.
+   *
+   * @param {Function} callback - The callback to remove.
+   * @return {void} This function does not return a value.
+   */
+  offEEG(callback) {
+    this.#eegListeners.delete(callback);
+  }
+
+  /**
+   * Subscribes to disconnection, whether requested with `disconnect()` or
+   * caused by the headband going away.
+   *
+   * @param {Function} callback - Called with no arguments on disconnection.
+   * @return {Function} A function that removes the subscription.
+   */
+  onDisconnect(callback) {
+    this.#disconnectListeners.add(callback);
+    return () => this.#disconnectListeners.delete(callback);
+  }
+
+  /**
+   * Dispatches an EEG event to `eegData` and to `onEEG` subscribers.
+   *
+   * @param {number} n - The index of the EEG channel.
+   * @param {Event} event - The event containing the EEG data.
+   * @return {void} This function does not return a value.
+   */
+  #handleEEG(n, event) {
+    const receivedAt = performance.now();
+    this.eegData(n, event);
+    if (this.#eegListeners.size === 0) return;
+    const packet = {
+      channel: n,
+      seq: this.eventEEGSequence(event),
+      samples: this.eventEEGData(event).map(eegToMicrovolts),
+      receivedAt,
+    };
+    for (const listener of this.#eegListeners) {
+      try {
+        listener(packet);
+      } catch (error) {
+        console.error("EEG listener failed:", error);
+      }
+    }
+  }
+
+  /**
+   * Resets the connection state after the headband went away, and notifies
+   * subclasses through `disconnected`.
+   *
+   * @return {void} This function does not return a value.
+   */
+  #handleDisconnect() {
+    if (this.#dev && this.#onGattDisconnected) {
+      this.#dev.removeEventListener(
+        "gattserverdisconnected",
+        this.#onGattDisconnected
+      );
+    }
+    this.#onGattDisconnected = null;
+    this.#dev = null;
+    this.#controlChar = null;
+    this.#state = 0;
+    this.disconnected();
+    for (const listener of this.#disconnectListeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.error("Disconnect listener failed:", error);
+      }
+    }
+  }
 
   /**
    * Decodes information from the given bytes array.
@@ -288,6 +404,18 @@ export class MuseBase {
   }
 
   /**
+   * Returns the packet sequence number from a given EEG event.
+   *
+   * @param {object} event - The event containing the EEG data.
+   * @return {number} The 16-bit packet sequence number.
+   */
+  eventEEGSequence(event) {
+    let data = event.target.value;
+    data = data.buffer ? data : new DataView(data);
+    return data.getUint16(0);
+  }
+
+  /**
    * Returns the PPG data from a given event.
    *
    * @param {object} event - The event containing the PPG data.
@@ -349,10 +477,10 @@ export class MuseBase {
     if (this.mock) {
       this.#stopMockDataStream();
     }
-    if (this.#dev) this.#dev["gatt"]["disconnect"]();
-    this.#dev = null;
-    this.#state = 0;
-    this.disconnected();
+    const dev = this.#dev;
+    // Detach the listener first so `disconnected` is called exactly once.
+    this.#handleDisconnect();
+    if (dev && dev["gatt"]["connected"]) dev["gatt"]["disconnect"]();
   }
   /**
    * Asynchronously connects to a characteristic in a BLE service and sets up a hook for characteristic value changes.
@@ -365,7 +493,7 @@ export class MuseBase {
   async #connectChar(service, cid, hook) {
     const c = await service["getCharacteristic"](cid);
     c["oncharacteristicvaluechanged"] = hook;
-    c["startNotifications"]();
+    await c["startNotifications"]();
     return c;
   }
   /**
@@ -403,7 +531,10 @@ export class MuseBase {
   }
 
   /**
-   * Starts the mock data streaming.
+   * Starts the mock data streaming. Like the real device, it emits one packet
+   * of 12 consecutive samples per channel every 12/256 s, with an
+   * incrementing sequence number. The CSV is assumed to be sampled at 256 Hz
+   * and is looped.
    *
    * @return {void}
    */
@@ -414,82 +545,78 @@ export class MuseBase {
     }
 
     this.mockDataIndex = 0;
-    const that = this;
+    this.#mockSeq = 0;
+    const packetMs = (1000 * EEG_SAMPLES_PER_PACKET) / EEG_SAMPLE_RATE;
+    const startedAt = performance.now();
+    let packetsSent = 0;
 
-    // Function to feed the next data point
-    const feedNextSample = () => {
-      if (!that.mock || that.#state !== 2) {
-        return;
+    // Timers are coarse and throttled in background tabs, so on each tick
+    // send every packet that is due rather than assuming one per tick.
+    const feedDuePackets = () => {
+      if (!this.mock || this.#state !== 2) return;
+      const due = Math.floor((performance.now() - startedAt) / packetMs);
+      while (packetsSent < due) {
+        this.#feedMockPacket();
+        packetsSent++;
       }
-
-      const currentSample = that.mockData[that.mockDataIndex];
-      const nextIndex = (that.mockDataIndex + 1) % that.mockData.length;
-      const nextSample = that.mockData[nextIndex];
-
-      // Calculate delay to next sample based on timestamps
-      let delay = 4; // Default ~250Hz if timestamps are missing
-      if (currentSample.timestamp && nextSample.timestamp) {
-        delay = nextSample.timestamp - currentSample.timestamp;
-        // Wrap around case
-        if (delay < 0) {
-          delay = 4; // Default delay when looping
-        }
-      }
-
-      // Feed EEG data to each channel
-      for (let i = 0; i < 4; i++) {
-        const mockEvent = {
-          target: {
-            value: that.#createMockEEGData(currentSample.eeg[i]),
-          },
-        };
-        that.eegData(i, mockEvent);
-      }
-
-      // Move to next sample
-      that.mockDataIndex = nextIndex;
-
-      // Schedule next sample
-      that.mockInterval = setTimeout(feedNextSample, delay);
     };
-
-    // Start feeding data
-    feedNextSample();
+    this.mockInterval = setInterval(feedDuePackets, packetMs);
   }
 
   /**
-   * Creates mock EEG data in the format expected by eventEEGData.
+   * Sends one mock packet per EEG channel, taken from the next 12 CSV rows.
    *
-   * @param {number} value - The EEG value to encode.
-   * @return {DataView} A DataView containing the mock EEG data.
+   * @return {void}
    */
-  #createMockEEGData(value) {
-    // The eventEEGData method expects 12-bit unsigned data
-    // Convert from scaled value back to 12-bit: value = 0.48828125 * (x - 0x800)
-    // Therefore: x = (value / 0.48828125) + 0x800
-    const unsigned12bit = Math.max(
-      0,
-      Math.min(0xfff, Math.round(value / 0.48828125 + 0x800))
-    );
+  #feedMockPacket() {
+    const rows = [];
+    for (let i = 0; i < EEG_SAMPLES_PER_PACKET; i++) {
+      rows.push(this.mockData[this.mockDataIndex]);
+      this.mockDataIndex = (this.mockDataIndex + 1) % this.mockData.length;
+    }
+    for (let ch = 0; ch < 4; ch++) {
+      const mockEvent = {
+        target: {
+          value: this.#createMockEEGData(
+            this.#mockSeq,
+            rows.map((row) => row.eeg[ch])
+          ),
+        },
+      };
+      this.#handleEEG(ch, mockEvent);
+    }
+    this.#mockSeq = (this.#mockSeq + 1) & 0xffff;
+  }
 
-    // Pack into bytes (12 samples = 18 bytes, we'll create 1 sample for simplicity)
-    // Format: each 12-bit sample takes 1.5 bytes
-    // For 12 samples: 18 bytes of data + 2 bytes header
+  /**
+   * Creates a mock EEG packet in the format expected by eventEEGData.
+   *
+   * @param {number} seq - The 16-bit packet sequence number.
+   * @param {number[]} values - 12 EEG values in microvolts.
+   * @return {DataView} A DataView containing the mock EEG packet.
+   */
+  #createMockEEGData(seq, values) {
+    // 2 bytes of sequence number, then 12 samples of 12 bits (18 bytes).
     const buffer = new ArrayBuffer(20);
     const view = new DataView(buffer);
     const uint8 = new Uint8Array(buffer);
+    view.setUint16(0, seq);
 
-    // Pack 12 identical samples (as the real device sends 12 samples per packet)
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < values.length; i++) {
+      // Inverse of eegToMicrovolts: x = value / 0.48828125 + 0x800
+      const x = Math.max(
+        0,
+        Math.min(0xfff, Math.round(values[i] / 0.48828125 + 0x800))
+      );
       const byteOffset = 2 + Math.floor(i * 1.5);
       if (i % 2 === 0) {
-        uint8[byteOffset] = (unsigned12bit >> 4) & 0xff;
-        uint8[byteOffset + 1] =
-          ((unsigned12bit & 0x0f) << 4) | ((unsigned12bit >> 8) & 0x0f);
+        // High 8 bits, then low 4 bits in the high nibble of the next byte.
+        uint8[byteOffset] = (x >> 4) & 0xff;
+        uint8[byteOffset + 1] = (x & 0x0f) << 4;
       } else {
-        uint8[byteOffset] =
-          (uint8[byteOffset] & 0xf0) | ((unsigned12bit >> 8) & 0x0f);
-        uint8[byteOffset + 1] = unsigned12bit & 0xff;
+        // High 4 bits in the low nibble, then the low 8 bits.
+        uint8[byteOffset] |= (x >> 8) & 0x0f;
+        uint8[byteOffset + 1] = x & 0xff;
       }
     }
 
@@ -503,7 +630,7 @@ export class MuseBase {
    */
   #stopMockDataStream() {
     if (this.mockInterval) {
-      clearTimeout(this.mockInterval);
+      clearInterval(this.mockInterval);
       this.mockInterval = null;
     }
   }
@@ -537,117 +664,76 @@ export class MuseBase {
       }
     }
 
-    // Real device connection
+    // Real device connection. Failures (including a cancelled device picker)
+    // reset the state and are rethrown so callers can tell they happened.
     try {
       this.#dev = await navigator["bluetooth"]["requestDevice"]({
         filters: [{ services: [this.#SERVICE] }],
       });
+      const gatt = await this.#dev["gatt"]["connect"]();
+      const service = await gatt["getPrimaryService"](this.#SERVICE);
+      this.#onGattDisconnected = () => this.#handleDisconnect();
+      this.#dev.addEventListener(
+        "gattserverdisconnected",
+        this.#onGattDisconnected
+      );
+      this.#controlChar = await this.#connectChar(
+        service,
+        this.#CONTROL_CHARACTERISTIC,
+        (event) => this.controlData(event)
+      );
+      await this.#connectChar(service, this.#BATTERY_CHARACTERISTIC, (event) =>
+        this.batteryData(event)
+      );
+      await this.#connectChar(
+        service,
+        this.#GYROSCOPE_CHARACTERISTIC,
+        (event) => this.gyroscopeData(event)
+      );
+      await this.#connectChar(
+        service,
+        this.#ACCELEROMETER_CHARACTERISTIC,
+        (event) => this.accelerometerData(event)
+      );
+      const ppgChars = [
+        this.#PPG1_CHARACTERISTIC,
+        this.#PPG2_CHARACTERISTIC,
+        this.#PPG3_CHARACTERISTIC,
+      ];
+      for (let n = 0; n < ppgChars.length; n++) {
+        await this.#connectChar(service, ppgChars[n], (event) =>
+          this.ppgData(n, event)
+        );
+      }
+      const eegChars = [
+        this.#EEG1_CHARACTERISTIC,
+        this.#EEG2_CHARACTERISTIC,
+        this.#EEG3_CHARACTERISTIC,
+        this.#EEG4_CHARACTERISTIC,
+        this.#EEG5_CHARACTERISTIC,
+      ];
+      for (let n = 0; n < eegChars.length; n++) {
+        await this.#connectChar(service, eegChars[n], (event) =>
+          this.#handleEEG(n, event)
+        );
+      }
+      await this.#start();
+      await this.#sendCommand("v1");
     } catch (error) {
+      const dev = this.#dev;
+      if (this.#onGattDisconnected && dev) {
+        dev.removeEventListener(
+          "gattserverdisconnected",
+          this.#onGattDisconnected
+        );
+      }
+      this.#onGattDisconnected = null;
       this.#dev = null;
+      this.#controlChar = null;
       this.#state = 0;
-      return;
+      if (dev && dev["gatt"]["connected"]) dev["gatt"]["disconnect"]();
+      throw error;
     }
-    let gatt = undefined;
-    try {
-      gatt = await this.#dev["gatt"]["connect"]();
-    } catch (error) {
-      this.#dev = null;
-      this.#state = 0;
-      return;
-    }
-    const service = await gatt["getPrimaryService"](this.#SERVICE);
-    const that = this;
-    this.#dev.addEventListener("gattserverdisconnected", function () {
-      this.#dev = null;
-      this.#state = 0;
-      that.disconnected();
-    });
-    this.#controlChar = await this.#connectChar(
-      service,
-      this.#CONTROL_CHARACTERISTIC,
-      function (event) {
-        that.controlData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#BATTERY_CHARACTERISTIC,
-      function (event) {
-        that.batteryData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#GYROSCOPE_CHARACTERISTIC,
-      function (event) {
-        that.gyroscopeData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#ACCELEROMETER_CHARACTERISTIC,
-      function (event) {
-        that.accelerometerData(event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#PPG1_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(0, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#PPG2_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(1, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#PPG3_CHARACTERISTIC,
-      function (event) {
-        that.ppgData(2, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG1_CHARACTERISTIC,
-      function (event) {
-        that.eegData(0, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG2_CHARACTERISTIC,
-      function (event) {
-        that.eegData(1, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG3_CHARACTERISTIC,
-      function (event) {
-        that.eegData(2, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG4_CHARACTERISTIC,
-      function (event) {
-        that.eegData(3, event);
-      }
-    );
-    await this.#connectChar(
-      service,
-      this.#EEG5_CHARACTERISTIC,
-      function (event) {
-        that.eegData(4, event);
-      }
-    );
-    await this.#start();
-    await this.#sendCommand("v1");
     this.#state = 2;
   }
 }
@@ -725,7 +811,7 @@ export class Muse extends MuseBase {
    * @return {void} This function does not return a value.
    */
   gyroscopeData(event) {
-    const vals = this.eventAccelerometerData(event);
+    const vals = this.eventGyroscopeData(event);
     for (let i = 0; i < 3; i++) {
       this.gyroscope[0].write(vals[0][i]);
       this.gyroscope[1].write(vals[1][i]);
@@ -746,7 +832,7 @@ export class Muse extends MuseBase {
   }
   /**
    * Processes EEG data from the given event, scales it to the range [-1000, 1000),
-   * and writes it to the corresponding PPG circular buffer.
+   * and writes it to the corresponding EEG circular buffer.
    *
    * @param {number} n - The index of the EEG channel.
    * @param {Event} event - The event containing the EEG data.
@@ -754,9 +840,7 @@ export class Muse extends MuseBase {
    */
   eegData(n, event) {
     let samples = this.eventEEGData(event);
-    samples = samples.map(function (x) {
-      return 0.48828125 * (x - 0x800);
-    });
+    samples = samples.map(eegToMicrovolts);
     for (let i = 0; i < samples.length; i++) {
       this.eeg[n].write(samples[i]);
     }

@@ -108,6 +108,10 @@ async function connectToMuse() {
   }, 1000 / 256); // 256Hz sampling rate
 }
 
+// To record every sample with its packet sequence number and arrival time,
+// subscribe instead of polling (see docs/API.md):
+// muse.onEEG(({ channel, seq, samples, receivedAt }) => { ... });
+
 // Or use mock mode for development (no device required!)
 async function connectToMuseMock() {
   const muse = await connectMuse({ mock: true });
@@ -211,13 +215,7 @@ You can provide your own CSV file in the same format for custom mock data scenar
 # Install dependencies
 npm install
 
-# Run example
-npm run dev
-
-# Build library
-npm run build
-
-# Run tests
+# Run tests (Node 20+)
 npm test
 ```
 
