@@ -11,6 +11,7 @@ Connects to a Muse device using Web Bluetooth API or uses mock data for developm
 - `options` (Object, optional) - Configuration options
   - `mock` (boolean, default: false) - Enable mock mode to use pre-recorded data
   - `mockDataPath` (string, optional) - Path to custom CSV file for mock data
+  - `preset` (string, default: `"p1035"`) - Muse S Athena preset (see `ATHENA_PRESETS`); ignored by other models
 
 **Examples:**
 
@@ -61,8 +62,13 @@ await muse.connect();
 - `accelerometer`: Array of `MuseCircularBuffer` instances for accelerometer data (3 axes)
 - `gyroscope`: Array of `MuseCircularBuffer` instances for gyroscope data (3 axes)
 - `batteryLevel`: Current battery level (number, 0-100)
+- `optics`: Array of 16 `MuseCircularBuffer` instances for Muse S Athena optics channels (raw samples, 64 Hz)
 - `state`: Connection state (0: disconnected, 1: connecting, 2: connected)
 - `mock`: Boolean indicating if mock mode is enabled
+- `isAthena`: Whether the headband is a Muse S Athena (MS-03)
+- `preset`: The Athena preset in use, or `null`
+- `eegChannelNames` / `opticsChannelNames`: Names of the channels being streamed
+- `stats`: Athena stream diagnostics `{ notifications, droppedSubpackets, skippedBytes }`, or `null`
 
 #### Methods
 
@@ -71,6 +77,8 @@ await muse.connect();
 - `onEEG(callback)`: Subscribes to EEG packets; returns an unsubscribe function. See below.
 - `offEEG(callback)`: Removes an `onEEG` subscription.
 - `onDisconnect(callback)`: Called once whenever the device disconnects, whether through `disconnect()` or because the headband went away. Returns an unsubscribe function.
+- `onOptics(callback)`: Muse S Athena only. Called with `{ seq, index, channels, names, receivedAt }` per optics packet; `channels` holds raw 20-bit samples per channel at 64 Hz. Returns an unsubscribe function.
+- `onMotion(callback)`: Muse S Athena only. Called with `{ seq, index, accelerometer, gyroscope, receivedAt }` (g and deg/s, x/y/z arrays, 52 Hz). Returns an unsubscribe function.
 
 #### Streaming every sample with `onEEG`
 
@@ -81,17 +89,18 @@ polling them can lose data. For recording, subscribe to packets instead:
 import { connectMuse, EEG_CHANNEL_NAMES } from "web-muse";
 
 const muse = await connectMuse();
-const unsubscribe = muse.onEEG(({ channel, seq, samples, receivedAt }) => {
-  // channel:    0=TP9, 1=AF7, 2=AF8, 3=TP10, 4=AUX
-  // seq:        16-bit packet sequence number from the device
-  // samples:    12 samples in microvolts
+const unsubscribe = muse.onEEG(({ channel, seq, index, samples, receivedAt }) => {
+  // channel:    0=TP9, 1=AF7, 2=AF8, 3=TP10, then AUX (see muse.eegChannelNames)
+  // seq:        packet sequence number from the device (16-bit; 8-bit on the Athena)
+  // index:      absolute index of samples[0] since connecting
+  // samples:    samples in microvolts (12 per packet; 4 or 2 on the Athena)
   // receivedAt: performance.now() when the packet arrived
-  console.log(EEG_CHANNEL_NAMES[channel], seq, samples);
+  console.log(muse.eegChannelNames[channel], index, samples);
 });
 ```
 
-Sample `i` of a packet has the absolute index `seq * 12 + i` (the sequence
-number wraps at 65536). Gaps in `seq` mean dropped packets, and fitting
+Sample `i` of a packet has the absolute index `index + i`, with the sequence
+number wraparound removed. Gaps in `index` mean dropped packets, and fitting
 `receivedAt` against sample index gives each sample a timestamp without
 Bluetooth jitter. The library also exports `EEG_SAMPLE_RATE` (256),
 `EEG_SAMPLES_PER_PACKET` (12), `EEG_CHANNEL_NAMES` and `eegToMicrovolts`.

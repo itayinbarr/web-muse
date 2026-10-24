@@ -17,9 +17,11 @@ A modern JavaScript library for connecting to Muse EEG devices using Web Bluetoo
 - Built-in signal processing utilities
 - React hooks and context for easy integration
 - **Mock data mode** for development and testing (no device required!)
+- **Muse S Athena (MS-03, 2025)** support, detected automatically, including fNIRS optics
 - Support for:
-  - EEG data (4 channels)
-  - PPG data (3 channels)
+  - EEG data (4 channels; 8 on the Athena with 8-channel presets)
+  - PPG data (3 channels, Muse 2)
+  - Optics / fNIRS data (4, 8 or 16 channels, Muse S Athena)
   - Accelerometer data
   - Gyroscope data
   - Battery level monitoring
@@ -166,6 +168,38 @@ function YourComponent() {
 }
 ```
 
+## Muse S Athena (MS-03)
+
+The 2025 Muse S ("Athena", USB-C, model MS-03) uses a different Bluetooth
+protocol from earlier headbands: every sensor is multiplexed onto a single
+characteristic as tagged, bit-packed subpackets. web-muse detects it on connect
+and decodes it into the same API, so `muse.eeg`, `onEEG` and the React hooks
+work unchanged. Decoding Athena data with the Muse 2 format yields noise; that
+was the cause of the earlier, unsupported behaviour.
+
+```javascript
+import { connectMuse, ATHENA_PRESETS } from "web-muse";
+
+// p1035 (default): 4 EEG channels + 4 optics channels
+// p1041: 8 EEG channels + 16 optics channels, p21: EEG only
+const muse = await connectMuse({ preset: "p1035" });
+
+if (muse.isAthena) {
+  muse.onOptics(({ index, channels, names }) => {
+    // names: ["LI_730", "RI_730", "LI_850", "RI_850"] (left/right inner, 730/850 nm)
+    // channels: raw 20-bit samples per channel, 64 Hz
+  });
+  muse.onMotion(({ accelerometer, gyroscope }) => {}); // g and deg/s, 52 Hz
+  console.log(muse.stats); // { notifications, droppedSubpackets, skippedBytes }
+}
+```
+
+EEG is 14-bit at 256 Hz, converted to microvolts as
+`(raw - 8192) * 1450 / 16383`. When the headband is not on a head, channels sit
+at the rails (about ±725 µV); that is expected. The protocol decoder is in
+[`src/lib/athena.js`](./src/lib/athena.js) and can be used on its own
+(`parseAthenaNotification`).
+
 ## Mock Mode for Development
 
 Mock mode allows you to develop and test your application without a physical Muse device. It plays back pre-recorded EEG data in a loop, providing realistic data for development and testing.
@@ -221,7 +255,7 @@ npm test
 
 ## Requirements
 
-- A Muse headband (tested with Muse 2 and Muse S)
+- A Muse headband (tested with Muse 2, Muse S and Muse S Athena)
 - A Web Bluetooth-compatible browser:
   - Chrome (desktop & android)
   - Edge (desktop)
@@ -247,3 +281,4 @@ MIT
 
 - Thanks to [muse-js](https://github.com/urish/muse-js) for pioneering Web Bluetooth support for Muse devices
 - Thanks to Interaxon for creating the Muse headband
+- The Muse S Athena protocol follows the reverse engineering in [OpenMuse](https://github.com/DominiqueMakowski/OpenMuse), [BrainFlow](https://github.com/brainflow-dev/brainflow) and [Polobase/muse.js](https://github.com/Polobase/muse.js)

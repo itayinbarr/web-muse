@@ -1,4 +1,14 @@
 import { MuseCircularBuffer } from "./CircularBuffer.js";
+import {
+  ATHENA_DATA_CHARACTERISTIC,
+  ATHENA_DATA2_CHARACTERISTIC,
+  ATHENA_DEFAULT_PRESET,
+  ATHENA_EEG_CHANNEL_NAMES,
+  ATHENA_OPTICS_CHANNEL_NAMES,
+  parseAthenaNotification,
+} from "./athena.js";
+
+export * from "./athena.js";
 
 /** EEG sampling rate of Muse headbands, in Hz. */
 export const EEG_SAMPLE_RATE = 256;
@@ -28,6 +38,14 @@ export const eegToMicrovolts = (x) => 0.48828125 * (x - 0x800);
  *
  * Consumers that need every EEG sample with timing information can instead
  * subscribe with `onEEG(callback)`, which receives one packet per call.
+ *
+ * The Muse S Athena (MS-03) sends all sensors over one characteristic and is
+ * detected automatically. Its data reaches subclasses through these hooks:
+ * - athenaEEGData     - called with one array of samples (µV) per EEG channel
+ * - opticsData        - called with one array of raw samples per optics channel
+ * - athenaMotionData  - called with accelerometer (g) and gyroscope (deg/s) samples
+ * - athenaBatteryData - called with the battery level in percent
+ * and to consumers through `onEEG`, `onOptics` and `onMotion`.
  */
 export class MuseBase {
   #SERVICE = 0xfe8d;
@@ -51,6 +69,14 @@ export class MuseBase {
   #disconnectListeners = new Set();
   #onGattDisconnected = null;
   #mockSeq = 0;
+  #seqTracker = new Map();
+  #isAthena = false;
+  #preset = ATHENA_DEFAULT_PRESET;
+  #opticsListeners = new Set();
+  #motionListeners = new Set();
+  #athenaStats = null;
+  #eegChannelCount = 4;
+  #opticsChannelCount = 0;
 
   /**
    * Constructs a new interface for connecting to a Muse headband.
@@ -60,11 +86,13 @@ export class MuseBase {
    * @param {Object} options - Configuration options
    * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
    * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
+   * @param {string} [options.preset="p1035"] - Muse S Athena preset (see ATHENA_PRESETS); ignored by other models
    */
   constructor(options = {}) {
     if (new.target === MuseBase) {
       throw new TypeError("Cannot construct MuseBase instances directly");
     }
+    if (options.preset) this.#preset = options.preset;
     this.mock = options.mock || false;
     this.mockDataPath =
       options.mockDataPath ||
@@ -81,6 +109,55 @@ export class MuseBase {
    */
   get state() {
     return this.#state;
+  }
+
+  /**
+   * Whether the connected headband is a Muse S Athena (MS-03).
+   *
+   * @type {boolean}
+   */
+  get isAthena() {
+    return this.#isAthena;
+  }
+
+  /**
+   * The Athena preset in use, or null for other models.
+   *
+   * @type {string|null}
+   */
+  get preset() {
+    return this.#isAthena ? this.#preset : null;
+  }
+
+  /**
+   * Names of the EEG channels the headband is streaming, by channel index.
+   *
+   * @type {string[]}
+   */
+  get eegChannelNames() {
+    return this.#isAthena
+      ? ATHENA_EEG_CHANNEL_NAMES.slice(0, this.#eegChannelCount)
+      : EEG_CHANNEL_NAMES.slice(0, 4);
+  }
+
+  /**
+   * Names of the optics channels the headband is streaming (empty if none).
+   *
+   * @type {string[]}
+   */
+  get opticsChannelNames() {
+    return ATHENA_OPTICS_CHANNEL_NAMES[this.#opticsChannelCount] || [];
+  }
+
+  /**
+   * Athena stream diagnostics: notifications received, subpackets lost
+   * (from gaps in the per-sensor counters) and bytes that could not be parsed.
+   * Null for other models.
+   *
+   * @type {{notifications: number, droppedSubpackets: number, skippedBytes: number}|null}
+   */
+  get stats() {
+    return this.#athenaStats ? { ...this.#athenaStats } : null;
   }
 
   /**
@@ -134,6 +211,39 @@ export class MuseBase {
    */
   ppgData(n, event) {}
   /**
+   * Processes Muse S Athena EEG samples.
+   *
+   * @abstract
+   * @param {number[][]} channels - One array of samples in microvolts per EEG channel.
+   * @return {void} This function does not return a value.
+   */
+  athenaEEGData(channels) {}
+  /**
+   * Processes Muse S Athena optics (fNIRS/PPG) samples.
+   *
+   * @abstract
+   * @param {number[][]} channels - One array of raw 20-bit samples per optics channel.
+   * @return {void} This function does not return a value.
+   */
+  opticsData(channels) {}
+  /**
+   * Processes Muse S Athena accelerometer and gyroscope samples.
+   *
+   * @abstract
+   * @param {number[][]} accelerometer - x, y and z sample arrays, in g.
+   * @param {number[][]} gyroscope - x, y and z sample arrays, in degrees per second.
+   * @return {void} This function does not return a value.
+   */
+  athenaMotionData(accelerometer, gyroscope) {}
+  /**
+   * Processes the Muse S Athena battery level.
+   *
+   * @abstract
+   * @param {number} percent - The battery level, between 0 and 100.
+   * @return {void} This function does not return a value.
+   */
+  athenaBatteryData(percent) {}
+  /**
    * A method that handles the disconnection event.
    *
    * @abstract
@@ -143,15 +253,20 @@ export class MuseBase {
   disconnected() {}
 
   /**
-   * Subscribes to EEG packets. The callback is called once per packet with
-   * `{ channel, seq, samples, receivedAt }`, where `channel` is the EEG
-   * characteristic index (0=TP9, 1=AF7, 2=AF8, 3=TP10, 4=AUX), `seq` is the
-   * device's 16-bit packet sequence number, `samples` holds 12 values in
-   * microvolts, and `receivedAt` is the `performance.now()` arrival time.
+   * Subscribes to EEG packets. The callback is called once per packet and
+   * channel with `{ channel, seq, index, samples, receivedAt }`:
+   * - `channel`: the EEG channel index (0=TP9, 1=AF7, 2=AF8, 3=TP10, then
+   *   AUX; see `eegChannelNames`)
+   * - `seq`: the device's packet sequence number (16-bit on the Muse 2,
+   *   8-bit on the Muse S Athena)
+   * - `index`: the absolute index of `samples[0]` since connecting, with the
+   *   sequence wraparound removed; gaps mean dropped packets
+   * - `samples`: values in microvolts (12 per packet on the Muse 2; 4 or 2
+   *   on the Athena, depending on the preset)
+   * - `receivedAt`: the `performance.now()` arrival time
    *
-   * Sample `i` of a packet has the absolute index `seq * 12 + i` (modulo the
-   * 16-bit wraparound of `seq`), which lets consumers detect dropped packets
-   * and reconstruct sample timing independently of Bluetooth jitter.
+   * Sample `i` of a packet has the absolute index `index + i`, which lets
+   * consumers reconstruct sample timing independently of Bluetooth jitter.
    *
    * @param {Function} callback - Called with each EEG packet.
    * @return {Function} A function that removes the subscription.
@@ -184,6 +299,77 @@ export class MuseBase {
   }
 
   /**
+   * Subscribes to Muse S Athena optics (fNIRS/PPG) packets. The callback is
+   * called once per packet with `{ seq, index, channels, names, receivedAt }`,
+   * where `channels` holds one array of raw 20-bit samples per optics channel
+   * (named by `names`, see `opticsChannelNames`), `index` is the absolute
+   * index of the first sample at 64 Hz, and `receivedAt` is the
+   * `performance.now()` arrival time.
+   *
+   * @param {Function} callback - Called with each optics packet.
+   * @return {Function} A function that removes the subscription.
+   */
+  onOptics(callback) {
+    this.#opticsListeners.add(callback);
+    return () => this.#opticsListeners.delete(callback);
+  }
+
+  /**
+   * Subscribes to Muse S Athena motion packets. The callback is called once
+   * per packet with `{ seq, index, accelerometer, gyroscope, receivedAt }`,
+   * where `accelerometer` (g) and `gyroscope` (deg/s) each hold x, y and z
+   * sample arrays, and `index` is the absolute index of the first sample at 52 Hz.
+   *
+   * @param {Function} callback - Called with each motion packet.
+   * @return {Function} A function that removes the subscription.
+   */
+  onMotion(callback) {
+    this.#motionListeners.add(callback);
+    return () => this.#motionListeners.delete(callback);
+  }
+
+  /**
+   * Calls each listener with a packet, isolating listener errors.
+   *
+   * @param {Set<Function>} listeners - The listeners to call.
+   * @param {Object} packet - The packet to deliver.
+   * @param {string} kind - The packet kind, for error messages.
+   * @return {void} This function does not return a value.
+   */
+  #emit(listeners, packet, kind) {
+    for (const listener of listeners) {
+      try {
+        listener(packet);
+      } catch (error) {
+        console.error(`${kind} listener failed:`, error);
+      }
+    }
+  }
+
+  /**
+   * Advances the unwrapped packet count of a stream from its wrapping
+   * sequence number.
+   *
+   * @param {string} key - Identifies the stream.
+   * @param {number} seq - The packet's sequence number.
+   * @param {number} modulo - The value at which the sequence number wraps.
+   * @return {{count: number, dropped: number}} The packet's position since
+   *   connecting, and how many packets were lost before it.
+   */
+  #trackSequence(key, seq, modulo) {
+    const last = this.#seqTracker.get(key);
+    let count = 0;
+    let dropped = 0;
+    if (last) {
+      const step = (seq - last.seq + modulo) % modulo || 1;
+      count = last.count + step;
+      dropped = step - 1;
+    }
+    this.#seqTracker.set(key, { seq, count });
+    return { count, dropped };
+  }
+
+  /**
    * Dispatches an EEG event to `eegData` and to `onEEG` subscribers.
    *
    * @param {number} n - The index of the EEG channel.
@@ -194,19 +380,82 @@ export class MuseBase {
     const receivedAt = performance.now();
     this.eegData(n, event);
     if (this.#eegListeners.size === 0) return;
+    const seq = this.eventEEGSequence(event);
+    const { count } = this.#trackSequence(`eeg${n}`, seq, 0x10000);
     const packet = {
       channel: n,
-      seq: this.eventEEGSequence(event),
+      seq,
+      index: count * EEG_SAMPLES_PER_PACKET,
       samples: this.eventEEGData(event).map(eegToMicrovolts),
       receivedAt,
     };
-    for (const listener of this.#eegListeners) {
-      try {
-        listener(packet);
-      } catch (error) {
-        console.error("EEG listener failed:", error);
+    this.#emit(this.#eegListeners, packet, "EEG");
+  }
+
+  /**
+   * Parses a notification from the Muse S Athena data characteristic and
+   * dispatches each sensor's samples to the subclass hooks and subscribers.
+   *
+   * @param {Event} event - The characteristic value changed event.
+   * @return {void} This function does not return a value.
+   */
+  #handleAthenaData(event) {
+    const receivedAt = performance.now();
+    const view = event.target.value;
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    const stats = this.#athenaStats;
+    stats.notifications++;
+    const result = parseAthenaNotification(bytes, (sub) => {
+      const nSamples = sub.values[0].length;
+      const { count, dropped } = this.#trackSequence(`athena${sub.tag}`, sub.index, 0x100);
+      stats.droppedSubpackets += dropped;
+      const index = count * nSamples;
+      switch (sub.type) {
+        case "eeg": {
+          this.#eegChannelCount = sub.values.length;
+          this.athenaEEGData(sub.values);
+          for (let ch = 0; ch < sub.values.length; ch++) {
+            this.#emit(
+              this.#eegListeners,
+              { channel: ch, seq: sub.index, index, samples: sub.values[ch], receivedAt },
+              "EEG"
+            );
+          }
+          break;
+        }
+        case "optics": {
+          this.#opticsChannelCount = sub.values.length;
+          this.opticsData(sub.values);
+          this.#emit(
+            this.#opticsListeners,
+            {
+              seq: sub.index,
+              index,
+              channels: sub.values,
+              names: this.opticsChannelNames,
+              receivedAt,
+            },
+            "Optics"
+          );
+          break;
+        }
+        case "motion": {
+          const accelerometer = sub.values.slice(0, 3);
+          const gyroscope = sub.values.slice(3, 6);
+          this.athenaMotionData(accelerometer, gyroscope);
+          this.#emit(
+            this.#motionListeners,
+            { seq: sub.index, index, accelerometer, gyroscope, receivedAt },
+            "Motion"
+          );
+          break;
+        }
+        case "battery":
+          this.athenaBatteryData(sub.values[0][0]);
+          break;
       }
-    }
+    });
+    stats.skippedBytes += result.skippedBytes;
   }
 
   /**
@@ -372,14 +621,22 @@ export class MuseBase {
   eventControlData(event) {
     let data = event.target.value;
     data = data.buffer ? data : new DataView(data);
-    const buf = new Uint8Array(data.buffer);
+    const buf = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     const str = this.#decodeInfo(buf);
     let info = {};
     for (let i = 0; i < str.length; i++) {
       const c = str[i];
       this.#infoFragment = this.#infoFragment + c;
       if (c === "}") {
-        const tmp = JSON.parse(this.#infoFragment);
+        let tmp;
+        try {
+          tmp = JSON.parse(this.#infoFragment);
+        } catch (error) {
+          // A fragment was lost; drop the partial message and resynchronise.
+          console.warn("Discarding malformed control message:", this.#infoFragment);
+          this.#infoFragment = "";
+          continue;
+        }
         this.#infoFragment = "";
         for (const key in tmp) {
           info[key] = tmp[key];
@@ -467,6 +724,41 @@ export class MuseBase {
     await this.#resume();
   }
   /**
+   * Starts streaming on a Muse S Athena: selects the preset and starts data
+   * transmission. The headband does not acknowledge presets, so this waits for
+   * EEG to arrive and retries the start command with "d" if it does not.
+   *
+   * @return {Promise<void>} A promise that resolves when the stream is started.
+   */
+  async #startAthena() {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const sequence = [
+      ["v6", 200],
+      ["s", 200],
+      ["h", 200],
+      [this.#preset, 200],
+      ["s", 200],
+      ["dc001", 50],
+      ["dc001", 100],
+      ["L1", 300],
+      ["s", 200],
+    ];
+    for (const [cmd, delay] of sequence) {
+      await this.#sendCommand(cmd);
+      await wait(delay);
+    }
+    // EEG subpackets are tagged 0x11 (4 channels) or 0x12 (8 channels).
+    const receivingEEG = () =>
+      this.#seqTracker.has(`athena${0x11}`) || this.#seqTracker.has(`athena${0x12}`);
+    for (let waited = 0; waited < 2000 && !receivingEEG(); waited += 100) await wait(100);
+    if (!receivingEEG()) {
+      // Some firmware versions reject dc001 and need the classic resume command.
+      await this.#sendCommand("d");
+      for (let waited = 0; waited < 2000 && !receivingEEG(); waited += 100) await wait(100);
+      if (!receivingEEG()) console.warn("Muse S Athena connected but no EEG data arrived yet");
+    }
+  }
+  /**
    * Disconnects from the device by calling the `disconnect` method on the `gatt` object of the `dev` property.
    * In mock mode, stops the data streaming.
    * Sets the `dev` property to `null` and the `state` property to `0`.
@@ -478,6 +770,10 @@ export class MuseBase {
       this.#stopMockDataStream();
     }
     const dev = this.#dev;
+    if (this.#isAthena && this.#controlChar) {
+      // Halt streaming; the headband also stops once the link is closed.
+      this.#sendCommand("h").catch(() => {});
+    }
     // Detach the listener first so `disconnected` is called exactly once.
     this.#handleDisconnect();
     if (dev && dev["gatt"]["connected"]) dev["gatt"]["disconnect"]();
@@ -666,9 +962,14 @@ export class MuseBase {
 
     // Real device connection. Failures (including a cancelled device picker)
     // reset the state and are rethrown so callers can tell they happened.
+    this.#seqTracker.clear();
+    this.#isAthena = false;
+    this.#athenaStats = null;
     try {
+      // Match by name as well, in case a headband does not advertise the service.
       this.#dev = await navigator["bluetooth"]["requestDevice"]({
-        filters: [{ services: [this.#SERVICE] }],
+        filters: [{ services: [this.#SERVICE] }, { namePrefix: "Muse" }],
+        optionalServices: [this.#SERVICE],
       });
       const gatt = await this.#dev["gatt"]["connect"]();
       const service = await gatt["getPrimaryService"](this.#SERVICE);
@@ -682,6 +983,32 @@ export class MuseBase {
         this.#CONTROL_CHARACTERISTIC,
         (event) => this.controlData(event)
       );
+
+      // The Muse S Athena has a single data characteristic instead of the
+      // per-sensor characteristics of earlier models.
+      const uuids = (await service["getCharacteristics"]()).map((c) =>
+        c["uuid"].toLowerCase()
+      );
+      if (
+        uuids.includes(ATHENA_DATA_CHARACTERISTIC) &&
+        !uuids.includes(this.#EEG1_CHARACTERISTIC)
+      ) {
+        this.#isAthena = true;
+        this.#athenaStats = { notifications: 0, droppedSubpackets: 0, skippedBytes: 0 };
+        const onData = (event) => this.#handleAthenaData(event);
+        await this.#connectChar(service, ATHENA_DATA_CHARACTERISTIC, onData);
+        if (uuids.includes(ATHENA_DATA2_CHARACTERISTIC)) {
+          try {
+            await this.#connectChar(service, ATHENA_DATA2_CHARACTERISTIC, onData);
+          } catch (error) {
+            // Usually silent, and subscribing fails on some platforms.
+          }
+        }
+        await this.#startAthena();
+        this.#state = 2;
+        return;
+      }
+
       await this.#connectChar(service, this.#BATTERY_CHARACTERISTIC, (event) =>
         this.batteryData(event)
       );
@@ -740,7 +1067,8 @@ export class MuseBase {
 
 /**
  * An interface for connecting with a Muse headband based on circular buffers of size 256.
- * Note: EEG data is mapped into the range [-1000, 1000).
+ * Note: EEG data is in microvolts, in the range [-1000, 1000) on the Muse 2 and
+ * [-725, 725] on the Muse S Athena.
  *
  * @extends MuseBase
  */
@@ -752,10 +1080,13 @@ export class Muse extends MuseBase {
    * @param {Object} options - Configuration options
    * @param {boolean} [options.mock=false] - Enable mock mode to use pre-recorded data instead of real device
    * @param {string} [options.mockDataPath] - Path to mock data CSV file (defaults to assets/resting-state.csv)
+   * @param {string} [options.preset="p1035"] - Muse S Athena preset (see ATHENA_PRESETS); ignored by other models
    */
   constructor(options = {}) {
     super(options);
     const BUFFER_SIZE = 256;
+    // Muse S Athena optics channels (up to 16), raw 20-bit samples at 64 Hz.
+    this.optics = Array.from({ length: 16 }, () => new MuseCircularBuffer(BUFFER_SIZE));
     this.batteryLevel = null;
     this.info = {};
     this.eeg = [
@@ -857,6 +1188,52 @@ export class Muse extends MuseBase {
     for (let i = 0; i < samples.length; i++) {
       this.ppg[n].write(samples[i]);
     }
+  }
+  /**
+   * Writes Muse S Athena EEG samples to the EEG circular buffers. In
+   * 8-channel presets, only the first auxiliary channel fits in `eeg[4]`.
+   *
+   * @param {number[][]} channels - One array of samples in microvolts per EEG channel.
+   * @return {void} This function does not return a value.
+   */
+  athenaEEGData(channels) {
+    const n = Math.min(channels.length, this.eeg.length);
+    for (let ch = 0; ch < n; ch++) {
+      for (const sample of channels[ch]) this.eeg[ch].write(sample);
+    }
+  }
+  /**
+   * Writes Muse S Athena optics samples to the optics circular buffers.
+   *
+   * @param {number[][]} channels - One array of raw samples per optics channel.
+   * @return {void} This function does not return a value.
+   */
+  opticsData(channels) {
+    for (let ch = 0; ch < channels.length; ch++) {
+      for (const sample of channels[ch]) this.optics[ch].write(sample);
+    }
+  }
+  /**
+   * Writes Muse S Athena motion samples to the accelerometer and gyroscope buffers.
+   *
+   * @param {number[][]} accelerometer - x, y and z sample arrays, in g.
+   * @param {number[][]} gyroscope - x, y and z sample arrays, in degrees per second.
+   * @return {void} This function does not return a value.
+   */
+  athenaMotionData(accelerometer, gyroscope) {
+    for (let axis = 0; axis < 3; axis++) {
+      for (const sample of accelerometer[axis]) this.accelerometer[axis].write(sample);
+      for (const sample of gyroscope[axis]) this.gyroscope[axis].write(sample);
+    }
+  }
+  /**
+   * Updates the battery level from the Muse S Athena.
+   *
+   * @param {number} percent - The battery level, between 0 and 100.
+   * @return {void} This function does not return a value.
+   */
+  athenaBatteryData(percent) {
+    this.batteryLevel = percent;
   }
 }
 
