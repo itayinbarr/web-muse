@@ -194,6 +194,10 @@ if (muse.isAthena) {
 }
 ```
 
+Validated on a Muse S Athena with firmware 3.1.15: no dropped packets over
+2-minute recordings, and the expected eyes-closed alpha peak (~9 Hz at TP9/TP10,
+about 5x stronger than with eyes open).
+
 EEG is 14-bit at 256 Hz, converted to microvolts as
 `(raw - 8192) * 1450 / 16383`. When the headband is not on a head, channels sit
 at the rails (about ±725 µV); that is expected. The protocol decoder is in
